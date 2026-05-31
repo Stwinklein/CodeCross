@@ -961,28 +961,28 @@ def evaluator_agent(
     # 下面是设计文档里的 rule-first 风险裁决：测试证据优先于模型话术。
     if reviewer_failures > len(reviewer_results) / 2:
         risk_level = "unknown"
-        reasoning = "More than half of reviewers failed."
+        reasoning = "超过半数 reviewer 执行失败。"
     elif any(finding.severity == "critical" for finding in supported):
         risk_level = "critical"
-        reasoning = "A critical finding has supporting test evidence."
+        reasoning = "严重 finding 已被测试证据支持。"
     elif any(finding.severity == "high" for finding in supported):
         risk_level = "high"
-        reasoning = "A high severity finding has supporting test evidence."
+        reasoning = "高风险 finding 已被测试证据支持。"
     elif any(finding.severity == "critical" for finding in unresolved_high):
         risk_level = "high"
-        reasoning = "A critical finding remains unresolved after evidence verification."
+        reasoning = "严重 finding 在证据验证后仍未解决。"
     elif unresolved_high:
         risk_level = "medium"
-        reasoning = "High severity findings remain inconclusive."
+        reasoning = "仍有高风险 finding 处于证据不足状态。"
     elif any(finding.severity == "medium" for finding in supported):
         risk_level = "medium"
-        reasoning = "A medium severity finding has supporting evidence."
+        reasoning = "中风险 finding 已被证据支持。"
     elif board_summary.error_count:
         risk_level = "medium"
-        reasoning = "The verification executor reported errors or blocked tests."
+        reasoning = "验证执行器报告了错误或被阻断的测试。"
     else:
         risk_level = "low"
-        reasoning = "No supported medium or high risk findings remain."
+        reasoning = "没有剩余已被证据支持的中高风险 finding。"
 
     top_findings = [
         finding.finding_id
@@ -992,7 +992,7 @@ def evaluator_agent(
         risk_level=risk_level,  # type: ignore[arg-type]
         confidence="high" if risk_level in {"low", "high", "critical"} else "medium",
         top_findings=top_findings,
-        evidence_summary=f"{board_summary.failed_count} failed tests, {board_summary.passed_count} passed tests.",
+        evidence_summary=f"失败测试 {board_summary.failed_count} 个，通过测试 {board_summary.passed_count} 个。",
         failed_tests_summary="\n".join(result.failure_summary for result in board_summary.failed_tests),
         coverage_gaps=board_summary.coverage_gaps,
         verification_summary=render_board_markdown(board_summary),

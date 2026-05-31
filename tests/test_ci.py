@@ -116,6 +116,17 @@ def test_build_pr_comment_contains_marker_summary_and_findings():
     assert "API Key 和 Base URL" in comment
 
 
+def test_build_pr_comment_handles_empty_state():
+    """CI 异常路径也应能渲染一条可读报告，而不是因为缺字段二次崩溃。"""
+
+    comment = build_pr_comment({})
+
+    assert COMMENT_MARKER in comment
+    assert "风险等级 | **未知风险 (`unknown`)**" in comment
+    assert "变更文件：无" in comment
+    assert "Reviewer 没有产出 finding。" in comment
+
+
 def test_build_pr_comment_renders_complex_chinese_dashboard():
     """复杂 PR 摘要应把多 reviewer、多状态和测试结果都直观展示出来。"""
 
@@ -233,6 +244,21 @@ def test_build_pr_comment_renders_complex_chinese_dashboard():
     assert "已被证据支持" in comment
     assert "证据不足" in comment
     assert comment.index("库存扣减") < comment.index("新增管理接口")
+
+
+def test_build_pr_comment_escapes_markdown_table_pipes():
+    """模型输出里的竖线不能破坏 GitHub Markdown 表格列数。"""
+
+    state = _sample_state()
+    finding = state["findings"][0]
+    finding.problem = "输入 a|b 会让表格错列"
+    finding.suggestion = "先执行 value.replace('|', '/') 再渲染"
+
+    comment = build_pr_comment(state)
+
+    assert "a\\|b" in comment
+    assert "replace('\\|', '/')" in comment
+
 
 
 def test_truncate_comment_keeps_marker():

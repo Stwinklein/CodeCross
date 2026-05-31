@@ -196,6 +196,17 @@ def _shorten(text: str, limit: int = 180) -> str:
     return cleaned[: limit - 1].rstrip() + "..."
 
 
+def _table_cell(text: str, limit: int = 180) -> str:
+    """渲染 Markdown 表格单元格前做最小转义。
+
+    LLM 输出里可能包含 ``|``，如果直接放进 GitHub Markdown 表格，会把一列拆成
+    多列，导致报告错位。这里先复用 ``_shorten`` 控制长度，再转义竖线；换行已经
+    在 ``_shorten`` 里被压成空格。
+    """
+
+    return _shorten(text, limit).replace("|", r"\|")
+
+
 def _severity_sort_key(finding: Finding) -> tuple[int, str]:
     """按审查优先级排序，严重问题永远排在低风险问题前面。"""
 
@@ -234,11 +245,11 @@ def _stop_reason_text(stop_reason: str) -> str:
     return f"{label} (`{raw}`)"
 
 
-def _merge_advice(risk_level: str, recommended_action: str) -> str:
+def _merge_advice(risk_level: str) -> str:
     """根据风险等级给出一眼可读的合并建议。
 
-    Evaluator 的 ``recommended_action`` 可能是一段自然语言，不一定适合放在摘要
-    第一行。这里用规则先给一个稳定、直观的判断，再在下方保留完整建议。
+    Evaluator 的 ``recommended_action`` 会在“建议动作”段落完整展示；看板第一行
+    只用规则给一个稳定、短句式的合并判断，避免模型长句把摘要表格撑开。
     """
 
     if risk_level in {"critical", "high"}:
@@ -304,8 +315,8 @@ def _render_findings_table(findings: list[Finding], board: Any, limit: int) -> s
             f"{SEVERITY_LABELS.get(finding.severity, finding.severity)} | "
             f"{verification_status} | "
             f"`{file_label}` | "
-            f"{_shorten(finding.problem)} | "
-            f"{_shorten(finding.suggestion)} |"
+            f"{_table_cell(finding.problem)} | "
+            f"{_table_cell(finding.suggestion)} |"
         )
 
     remaining = len(findings) - limit
@@ -389,7 +400,7 @@ def build_pr_comment(
         "| 项目 | 结果 |",
         "| --- | --- |",
         f"| 风险等级 | **{_risk_text(risk_level)}** |",
-        f"| 合并建议 | **{_merge_advice(risk_level, recommended_action)}** |",
+        f"| 合并建议 | **{_merge_advice(risk_level)}** |",
         f"| 置信度 | {_confidence_text(confidence)} |",
         f"| 运行模式 | {mode_label} |",
         f"| Reviewer 模型 | {_model_label_from_state(state)} |",
