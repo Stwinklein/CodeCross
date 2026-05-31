@@ -597,7 +597,11 @@ def test_case_agent(
                 (
                     "system",
                     "You are the CodeCross Test Case Agent. Generate safe pytest tests only. "
-                    "Do not use network, subprocess, filesystem mutation, eval, or exec.",
+                    "Do not use network, subprocess, filesystem mutation, eval, or exec. "
+                    "Never emit placeholder tests, pass-only tests, or `assert True` tests. "
+                    "If a target is JavaScript/TypeScript/Vue, do not import it as a Python module; "
+                    "either write a concrete static pytest that reads the source file and asserts "
+                    "specific text/structure, or put the finding in skipped_targets.",
                 ),
                 (
                     "user",
@@ -646,7 +650,10 @@ def test_author_agent(
                     "system",
                     "You are the CodeCross Test Author Agent. Review draft pytest cases, "
                     "keep them safe, add narrow control tests when useful, and never use "
-                    "network, subprocess, filesystem mutation, eval, or exec.",
+                    "network, subprocess, filesystem mutation, eval, or exec. "
+                    "Reject placeholder tests, pass-only tests, and `assert True` tests. "
+                    "For JavaScript/TypeScript/Vue targets, do not convert file paths into Python imports; "
+                    "use concrete static source assertions or return skipped_targets instead.",
                 ),
                 (
                     "user",

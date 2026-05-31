@@ -7,6 +7,7 @@ from __future__ import annotations
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -70,6 +71,18 @@ SECONDARY_BLOCKED_TEXT_MARKERS = [
     "bash -c",
 ]
 
+# 这些短语通常意味着模型没有生成真正的验证代码，而是在写“占位测试”。
+# 如果让这类测试进入 pytest，它们往往会因为 `assert True` 通过，从而把 finding
+# 错误地标成 refuted。这里把它们降级为 skipped，让 Board 保持 inconclusive。
+LOW_VALUE_TEST_MARKERS = (
+    "placeholder",
+    "replace with actual",
+    "actual implementation would",
+    "cannot import the actual",
+    "we assume",
+    "this test documents",
+)
+
 
 def _string_literal(node: ast.AST | None) -> str | None:
     """如果 AST 节点是字符串字面量则返回文本，否则返回 None。"""
@@ -94,6 +107,102 @@ def _call_name(node: ast.AST) -> str:
         prefix = _call_name(node.value)
         return f"{prefix}.{node.attr}" if prefix else node.attr
     return ""
+
+
+def _is_constant_true(node: ast.AST) -> bool:
+    """判断一个 assert 表达式是否只是 `assert True` 这种无效证明。"""
+
+    return isinstance(node, ast.Constant) and node.value is True
+
+
+def _call_is_pytest_raises(node: ast.AST) -> bool:
+    """识别 `pytest.raises(...)`，它也是一种有效断言形式。"""
+
+    return _call_name(node).endswith("pytest.raises")
+
+
+class TestValueVisitor(ast.NodeVisitor):
+    """检查生成测试是否真的包含可用断言。
+
+    这个 visitor 和安全 sanitizer 分开：安全检查回答“能不能跑”，价值检查回答
+    “跑过以后能不能作为证据”。一个安全但只有 `assert True` 的测试不危险，但它
+    对 finding 没有证明力，所以不能让 Board 用它反驳 reviewer。
+    """
+
+    def __init__(self) -> None:
+        self.test_function_count = 0
+        self.meaningful_assert_count = 0
+        self.trivial_assert_count = 0
+        self.pytest_raises_count = 0
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        if node.name.startswith("test_"):
+            self.test_function_count += 1
+        self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        if node.name.startswith("test_"):
+            self.test_function_count += 1
+        self.generic_visit(node)
+
+    def visit_Assert(self, node: ast.Assert) -> None:
+        if _is_constant_true(node.test):
+            self.trivial_assert_count += 1
+        else:
+            self.meaningful_assert_count += 1
+        self.generic_visit(node)
+
+    def visit_With(self, node: ast.With) -> None:
+        for item in node.items:
+            if isinstance(item.context_expr, ast.Call) and _call_is_pytest_raises(item.context_expr):
+                self.pytest_raises_count += 1
+        self.generic_visit(node)
+
+
+def low_value_test_reason(test_case: TestCase) -> str:
+    """返回测试缺乏证据价值的原因；空字符串表示可以执行。
+
+    这里故意不要求测试一定 import 目标模块，因为有些非 Python 项目可以通过读取
+    源文件做静态验证。但至少要有真实断言、`pytest.raises`，且不能出现明显的
+    placeholder 文案。
+    """
+
+    try:
+        tree = ast.parse(test_case.test_code)
+    except SyntaxError:
+        # 语法错误交给安全检查处理，那里会返回 unsafe。
+        return ""
+
+    visitor = TestValueVisitor()
+    visitor.visit(tree)
+    lowered = test_case.test_code.lower()
+    if visitor.test_function_count == 0:
+        return "no_pytest_test_function"
+    if visitor.meaningful_assert_count == 0 and visitor.pytest_raises_count == 0:
+        for marker in LOW_VALUE_TEST_MARKERS:
+            if marker in lowered:
+                return f"low_value_test_marker:{marker}"
+        if visitor.trivial_assert_count:
+            return "only_trivial_assert_true"
+        return "no_meaningful_assertion"
+    return ""
+
+
+def _contains_blocked_command_marker(text: str, command: str) -> bool:
+    """用边界匹配命令黑名单，避免 `rm ` 误伤 `confirm `。
+
+    早期实现直接做 substring 检查，WebAPI 的静态检查注释里出现 "confirm the"
+    就会命中 `rm `。这里把命令当成独立 token 匹配，仍能拦截 `rm path`、
+    `bash -c`，但不会误杀普通英文单词。
+    """
+
+    marker = command.strip().lower()
+    if not marker:
+        return False
+    escaped = re.escape(marker)
+    if re.search(r"^[a-z0-9_.-]+$", marker):
+        return re.search(rf"(?<![\w.-]){escaped}(?![\w.-])", text) is not None
+    return marker in text
 
 
 def _open_call_writes(call: ast.Call) -> bool:
@@ -188,7 +297,7 @@ def is_safe_test_code(test_case: TestCase, runner_config: RunnerConfig) -> tuple
         if blocked.lower() in lowered:
             return False, f"blocked_text_marker:{blocked}"
     for command in runner_config.blocked_commands:
-        if command.lower() in lowered:
+        if _contains_blocked_command_marker(lowered, command):
             return False, f"blocked_command:{command}"
     return True, ""
 
@@ -223,6 +332,29 @@ def _unsafe_result(test_case: TestCase, round_index: int, reason: str) -> TestRe
         status="unsafe",
         failure_summary=reason,
         error_type="sanitizer_block",
+        related_finding_ids=test_case.related_finding_ids,
+    )
+
+
+def _skipped_result(
+    test_case: TestCase,
+    round_index: int,
+    reason: str,
+    *,
+    error_type: str = "skipped",
+) -> TestResult:
+    """把“不能形成有效证据”的测试显式写成 skipped 结果。
+
+    skipped 不会支持或反驳 finding，只会让 Board 进入 inconclusive 路径。这样比
+    静默丢弃测试更容易排查，也避免低价值测试通过后产生假阴性。
+    """
+
+    return TestResult(
+        test_case_id=test_case.test_case_id,
+        round_index=round_index,
+        status="skipped",
+        failure_summary=reason,
+        error_type=error_type,
         related_finding_ids=test_case.related_finding_ids,
     )
 
@@ -373,6 +505,15 @@ def execute_pytest_case(
     if not safe:
         return _unsafe_result(test_case, round_index, reason)
 
+    low_value_reason = low_value_test_reason(test_case)
+    if low_value_reason:
+        return _skipped_result(
+            test_case,
+            round_index,
+            low_value_reason,
+            error_type="low_value_test",
+        )
+
     root = Path(project_root).resolve()
     first = _run_pytest_once(
         test_case,
@@ -418,15 +559,23 @@ def execute_test_cases(
     """按当前轮预算执行一批 TestCase。"""
 
     results: list[TestResult] = []
-    for test_case in test_cases[: runner_config.max_tests_per_round]:
-        if test_case.test_type != "pytest":
+    # select_next_verification_targets 已经限制了“本轮最多验证多少 finding”。
+    # Test Author 可能会再加正常路径对照用例，所以 executor 给实际测试数留出 2 倍余量；
+    # 超出余量的测试会显式标记 skipped，而不是静默丢失。
+    execution_limit = max(
+        runner_config.max_tests_per_round,
+        runner_config.max_tests_per_round * 2,
+    )
+    for test_case in test_cases[:execution_limit]:
+        # static_check 的 test_code 仍然是 Python/pytest 代码，只是语义上表示
+        # “读源码做静态断言”。WebAPI 这类 JS 项目短期就靠它提供可执行证据。
+        if test_case.test_type not in {"pytest", "static_check"}:
             results.append(
-                TestResult(
-                    test_case_id=test_case.test_case_id,
-                    round_index=round_index,
-                    status="skipped",
-                    failure_summary=f"Unsupported test_type: {test_case.test_type}",
-                    related_finding_ids=test_case.related_finding_ids,
+                _skipped_result(
+                    test_case,
+                    round_index,
+                    f"Unsupported test_type: {test_case.test_type}",
+                    error_type="unsupported_test_type",
                 )
             )
             continue
@@ -436,6 +585,15 @@ def execute_test_cases(
                 project_root=project_root,
                 round_index=round_index,
                 runner_config=runner_config,
+            )
+        )
+    for test_case in test_cases[execution_limit:]:
+        results.append(
+            _skipped_result(
+                test_case,
+                round_index,
+                f"Skipped because generated test count exceeded execution limit {execution_limit}.",
+                error_type="max_tests_per_round_exceeded",
             )
         )
     return results
