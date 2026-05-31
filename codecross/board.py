@@ -30,6 +30,22 @@ from .schemas import (
 
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
+VERIFICATION_STATUS_LABELS = {
+    "supported": "已被证据支持",
+    "refuted": "已被测试反驳",
+    "unverified": "尚未验证",
+    "inconclusive": "证据不足",
+    "not_testable": "无法自动测试",
+}
+
+STOP_REASON_LABELS = {
+    "not stopped": "未提前停止",
+    "verification_queue_empty": "验证队列已清空",
+    "max_verification_rounds_reached": "达到最大验证轮次",
+    "no_verification_progress": "本轮验证没有新增进展",
+    "verification_queue_has_unresolved_targets": "仍有待验证目标",
+}
+
 
 def severity_rank(finding: Finding) -> int:
     """把严重等级转换成可排序数字。"""
@@ -410,17 +426,24 @@ def render_board_markdown(summary: BoardSummary) -> str:
     status_counts: dict[str, int] = defaultdict(int)
     for verification in summary.finding_verifications.values():
         status_counts[verification.status] += 1
-    status_text = ", ".join(f"{key}: {value}" for key, value in sorted(status_counts.items()))
+    status_text = ", ".join(
+        f"{VERIFICATION_STATUS_LABELS.get(key, key)}：{value}"
+        for key, value in sorted(status_counts.items())
+    )
+    stop_reason = STOP_REASON_LABELS.get(
+        summary.stop_reason or "not stopped",
+        summary.stop_reason or "未提前停止",
+    )
     return (
-        "## Review Board\n\n"
-        f"- Reviewers: {summary.reviewer_count}\n"
-        f"- Findings: {summary.finding_count}\n"
-        f"- Test intents: {summary.test_intent_count}\n"
-        f"- Test cases: {summary.test_case_count}\n"
-        f"- Test rounds: {summary.test_round_count}\n"
-        f"- Passed tests: {summary.passed_count}\n"
-        f"- Failed tests: {summary.failed_count}\n"
-        f"- Error/blocked tests: {summary.error_count}\n"
-        f"- Verification status: {status_text or 'none'}\n"
-        f"- Stop reason: {summary.stop_reason or 'not stopped'}\n"
+        "## 证据看板\n\n"
+        f"- 审查器数量：{summary.reviewer_count}\n"
+        f"- 问题数量：{summary.finding_count}\n"
+        f"- 测试意图：{summary.test_intent_count}\n"
+        f"- 测试用例：{summary.test_case_count}\n"
+        f"- 验证轮次：{summary.test_round_count}\n"
+        f"- 通过测试：{summary.passed_count}\n"
+        f"- 失败测试：{summary.failed_count}\n"
+        f"- 错误/阻塞测试：{summary.error_count}\n"
+        f"- 验证状态：{status_text or '无'}\n"
+        f"- 停止原因：{stop_reason}\n"
     )

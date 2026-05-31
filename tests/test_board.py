@@ -6,6 +6,7 @@
 from codecross.board import (
     build_board_summary,
     init_finding_verifications,
+    render_board_markdown,
     should_continue_verification,
     update_finding_verifications_from_results,
 )
@@ -127,3 +128,27 @@ def test_board_stops_when_round_has_no_verification_progress():
 
     assert should_continue is False
     assert reason == "no_verification_progress"
+
+
+def test_board_markdown_is_localized():
+    """最终报告里的 Board 看板应使用中文标签。"""
+
+    summary = BoardSummary(
+        reviewer_count=2,
+        finding_count=3,
+        test_intent_count=4,
+        test_case_count=5,
+        test_round_count=1,
+        passed_count=2,
+        failed_count=0,
+        error_count=1,
+        stop_reason="verification_queue_empty",
+    )
+
+    markdown = render_board_markdown(summary)
+
+    assert "## 证据看板" in markdown
+    assert "审查器数量：2" in markdown
+    assert "停止原因：验证队列已清空" in markdown
+    assert "Review Board" not in markdown
+    assert "Reviewers" not in markdown

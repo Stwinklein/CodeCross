@@ -1119,6 +1119,25 @@ def _localized_report_list(items: list[str], *, empty: str = "无") -> str:
     return ", ".join(visible) if visible else empty
 
 
+def _display_changed_symbols(items: list[str]) -> str:
+    cleaned_items = [" ".join((item or "").split()) for item in items]
+    cleaned_items = [item for item in cleaned_items if item]
+    if not cleaned_items:
+        return "无"
+
+    visible: list[str] = []
+    prose_count = 0
+    for item in cleaned_items:
+        if " " in item and needs_chinese_fallback(item):
+            prose_count += 1
+            continue
+        visible.append(polish_report_terms(item))
+
+    if prose_count:
+        visible.append(f"{prose_count} 条变更说明已保留在结构化 JSON 产物中")
+    return ", ".join(visible) if visible else f"{len(cleaned_items)} 条变更说明已保留在结构化 JSON 产物中"
+
+
 def render_final_report(
     *,
     review_plan: ReviewPlan,
@@ -1178,7 +1197,7 @@ def render_final_report(
         context_section = (
             "\n## 代码上下文\n\n"
             f"- 变更文件：{', '.join(code_context.changed_files) or '无'}\n"
-            f"- 变更符号：{', '.join(code_context.changed_symbols) or '无'}\n"
+            f"- 变更符号：{_display_changed_symbols(code_context.changed_symbols)}\n"
             f"- 上下文片段数：{len(code_context.snippets)}\n"
             f"- 未能读取的文件：{', '.join(code_context.missing_files) or '无'}\n\n"
         )
@@ -1232,7 +1251,7 @@ def render_final_report(
         f"- 建议动作：{presentation.recommended_action or merge_advice(evaluator_report.risk_level)}\n\n"
         "## 审查计划\n\n"
         f"- 变更文件：{', '.join(review_plan.changed_files) or '无'}\n"
-        f"- 变更符号：{', '.join(review_plan.changed_symbols) or '无'}\n"
+        f"- 变更符号：{_display_changed_symbols(review_plan.changed_symbols)}\n"
         f"- 风险方向：{_localized_report_list(review_plan.risk_areas)}\n"
         f"- 测试重点：{_localized_report_list(review_plan.testing_focus)}\n\n"
         + context_section

@@ -216,6 +216,7 @@ def test_final_report_localizes_and_deduplicates_findings():
     report = agents.render_final_report(
         review_plan=ReviewPlan(
             changed_files=["src/utils/readUpload.js"],
+            changed_symbols=["checkout_codecross step removed continue-on-error"],
             risk_areas=["secret handling", "regression risk"],
             testing_focus=["high severity findings first", "pytest evidence for reproducible issues"],
         ),
@@ -257,7 +258,10 @@ def test_final_report_localizes_and_deduplicates_findings():
     assert "path.resolve" in report
     assert "优先验证高严重度问题" in report
     assert "高风险二次确认已完成" in report
+    assert "证据看板" in report
     assert "Path traversal vulnerability" not in report
+    assert "Review Board" not in report
+    assert "checkout_codecross step removed" not in report
     assert "Block merge until fixed" not in report
     assert "A critical finding has supporting evidence" not in report
     assert "Reviewer identified a blocking issue" not in report
