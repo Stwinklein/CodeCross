@@ -136,8 +136,13 @@ def _model_label_from_state(state: CodeCrossState) -> str:
 def _render_report_findings_table(rows_to_render: list[ReportFindingRow], limit: int) -> str:
     """Render formatter-agent finding rows into a compact Markdown table."""
 
+    rows_to_render = [
+        row
+        for row in rows_to_render
+        if "反驳" not in (row.verification_status or "")
+    ]
     if not rows_to_render:
-        return "Reviewer 没有产出 finding。"
+        return "当前没有剩余已被证据支持或待人工确认的重点问题；已被测试反驳的 finding 保留在完整 CI artifact 中。"
 
     rows = [
         "| 严重级别 | 验证状态 | 位置 | 问题 | 建议 |",

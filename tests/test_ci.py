@@ -14,6 +14,7 @@ from codecross.ci import (
     validate_model_credentials,
 )
 from codecross.config import ModelSettings, ProjectConfig
+from codecross.reporting import build_default_report_presentation
 from codecross.schemas import (
     BoardSummary,
     CodeContext,
@@ -153,7 +154,100 @@ def test_build_pr_comment_handles_empty_state():
     assert COMMENT_MARKER in comment
     assert "风险等级 | **未知风险 (`unknown`)**" in comment
     assert "变更文件：无" in comment
-    assert "Reviewer 没有产出 finding。" in comment
+    assert "当前没有剩余已被证据支持或待人工确认的重点问题" in comment
+
+
+def test_build_pr_comment_hides_refuted_formatter_rows():
+    """重点问题表应降噪已被测试反驳的 finding。"""
+
+    state = _sample_state()
+    state["report_presentation"] = ReportPresentation(
+        conclusion_summary="本次 PR 还有一个可确认问题。",
+        recommended_action="人工确认后合并。",
+        finding_rows=[
+            ReportFindingRow(
+                finding_ids=["refuted"],
+                severity="high",
+                verification_status="已被测试反驳",
+                location="src/app.py:1",
+                problem="已反驳的问题",
+                suggestion="无需修复。",
+            ),
+            ReportFindingRow(
+                finding_ids=["supported"],
+                severity="medium",
+                verification_status="已被证据支持",
+                location="src/app.py:2",
+                problem="仍需处理的问题",
+                suggestion="补一条保护逻辑。",
+            ),
+        ],
+    )
+
+    comment = build_pr_comment(state)
+
+    assert "仍需处理的问题" in comment
+    assert "已反驳的问题" not in comment
+
+
+def test_default_presentation_keeps_unknown_findings_actionable_without_placeholder():
+    """未知英文 finding 不能退化成“未能稳定中文化”的占位句。"""
+
+    supported = Finding(
+        source_reviewer="logic_reviewer",
+        model="deepseek/deepseek-chat",
+        category="security",
+        severity="medium",
+        file_path=".github/workflows/codecross-pr-review.yml",
+        line_range=LineRange(start=56, end=64),
+        problem="Shell command interpolates pull request metadata into a bash command.",
+        evidence="The workflow builds a git diff in a shell step.",
+        impact="A malformed value could break the diff generation step.",
+        suggestion="Keep values in environment variables and fail fast on unexpected input.",
+    )
+    refuted = Finding(
+        source_reviewer="logic_reviewer",
+        model="deepseek/deepseek-chat",
+        category="performance",
+        severity="medium",
+        file_path=".github/workflows/codecross-pr-review.yml",
+        line_range=LineRange(start=132, end=132),
+        problem="fs.readFileSync blocks the event loop.",
+        evidence="github-script reads the generated comment synchronously.",
+        impact="Request handlers could be blocked.",
+        suggestion="Use fs.promises.readFile.",
+    )
+    board = BoardSummary(
+        finding_count=2,
+        finding_verifications={
+            supported.finding_id: FindingVerification(
+                finding_id=supported.finding_id,
+                status="supported",
+            ),
+            refuted.finding_id: FindingVerification(
+                finding_id=refuted.finding_id,
+                status="refuted",
+            ),
+        },
+    )
+
+    presentation = build_default_report_presentation(
+        findings=[refuted, supported],
+        board_summary=board,
+        evaluator_report=EvaluatorReport(
+            risk_level="medium",
+            confidence="medium",
+            recommended_action="Confirm the remaining issue before merge.",
+        ),
+    )
+
+    assert len(presentation.finding_rows) == 1
+    row = presentation.finding_rows[0]
+    assert row.finding_ids == [supported.finding_id]
+    assert "未能稳定中文化" not in row.problem
+    assert "security风险需要人工复核" not in row.problem
+    assert "安全风险需要人工复核" in row.problem
+    assert "fs.readFileSync" not in row.problem
 
 
 def test_build_pr_comment_renders_complex_chinese_dashboard():

@@ -18,6 +18,7 @@ from .schemas import (
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _ASCII_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+_PLACEHOLDER_RE = re.compile(r"未能稳定中文化|请结合完整产物中的原始记录复核")
 
 
 RISK_LABELS = {
@@ -263,17 +264,29 @@ def severity_sort_key(finding: Finding) -> tuple[int, str]:
     return (severity_order.get(finding.severity, 9), finding.file_path)
 
 
-def _fallback_problem(finding: Finding) -> str:
+def has_formatter_placeholder(text: str) -> bool:
+    """Detect generic formatter fallback prose that should not reach PR comments."""
+
+    return bool(_PLACEHOLDER_RE.search(text or ""))
+
+
+def _manual_review_problem(finding: Finding) -> str:
     category = CATEGORY_LABELS.get(finding.category, finding.category or "代码")
-    severity = SEVERITY_LABELS.get(finding.severity, finding.severity)
-    return (
-        f"审查器将这里标记为{severity}级{category}风险；详细说明未能稳定中文化，"
-        "请结合完整产物中的原始记录复核。"
-    )
+    detail = finding.problem or finding.evidence or finding.impact
+    if detail:
+        return f"{category}风险需要人工复核：{shorten(detail, 150)}"
+    return f"{category}风险需要人工复核。"
+
+
+def _fallback_problem(finding: Finding) -> str:
+    return _manual_review_problem(finding)
 
 
 def _fallback_suggestion(finding: Finding) -> str:
     category = CATEGORY_LABELS.get(finding.category, finding.category or "相关")
+    detail = finding.suggestion or finding.impact
+    if detail:
+        return f"先按{category}风险人工复核该位置；原始修复建议：{shorten(detail, 150)}"
     return f"先按{category}风险人工复核该位置，补充必要测试，修复后重新运行 CodeCross。"
 
 
@@ -379,6 +392,10 @@ def build_default_report_presentation(
     seen: dict[tuple[str, str, str], ReportFindingRow] = {}
     verifications = board_summary.finding_verifications if board_summary else {}
     for finding in sorted(findings, key=severity_sort_key):
+        verification = verifications.get(finding.finding_id)
+        if verification and verification.status == "refuted":
+            continue
+
         problem, suggestion = localized_finding_text(finding)
         location = _location(finding)
         key = (finding.severity, location, problem)
@@ -389,7 +406,6 @@ def build_default_report_presentation(
                 existing.source_reviewers.append(finding.source_reviewer)
             continue
 
-        verification = verifications.get(finding.finding_id)
         row = ReportFindingRow(
             finding_ids=[finding.finding_id],
             severity=finding.severity,
@@ -435,11 +451,11 @@ def normalize_report_presentation(
                 row.location = fallback_row.location
             if not row.verification_status:
                 row.verification_status = fallback_row.verification_status
-            if needs_chinese_fallback(row.problem):
+            if needs_chinese_fallback(row.problem) or has_formatter_placeholder(row.problem):
                 row.problem = fallback_row.problem
             else:
                 row.problem = polish_report_terms(row.problem)
-            if needs_chinese_fallback(row.suggestion):
+            if needs_chinese_fallback(row.suggestion) or has_formatter_placeholder(row.suggestion):
                 row.suggestion = fallback_row.suggestion
             else:
                 row.suggestion = polish_report_terms(row.suggestion)
