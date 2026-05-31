@@ -5,7 +5,16 @@ import pytest
 import codecross.agents as agents
 from codecross.config import ModelSettings, load_project_config
 from codecross.llm import ModelCallError
-from codecross.schemas import Finding, LineRange, ReviewPlan, TestCase, TestIntent
+from codecross.schemas import (
+    BoardSummary,
+    EvaluatorReport,
+    Finding,
+    FindingVerification,
+    LineRange,
+    ReviewPlan,
+    TestCase,
+    TestIntent,
+)
 
 
 def test_parse_changed_files_handles_rename_and_hunk_notes():
@@ -163,3 +172,65 @@ def test_mock_test_author_adds_normal_path_control_case():
     names = [test_case.test_name for test_case in batch.test_cases]
     assert "test_safe_divide_zero_denominator_returns_none" in names
     assert "test_safe_divide_normal_division_returns_quotient" in names
+
+
+def test_report_formatter_localizes_and_deduplicates_findings():
+    """Final presentation agent should polish raw reviewer output without changing facts."""
+
+    first = Finding(
+        finding_id="finding_path_1",
+        source_reviewer="logic_reviewer",
+        model="deepseek/mock",
+        category="security",
+        severity="critical",
+        file_path="src/utils/readUpload.js",
+        line_range=LineRange(start=11, end=13),
+        problem="Path traversal vulnerability: filename is concatenated without normalization.",
+        evidence="rootDir + '/' + filename is used directly.",
+        impact="Attackers can read files outside the upload root.",
+        suggestion="Use path.resolve and ensure the resolved path stays within rootDir.",
+    )
+    duplicate = Finding(
+        finding_id="finding_path_2",
+        source_reviewer="security_maintainability_reviewer",
+        model="anthropic/mock",
+        category="security",
+        severity="critical",
+        file_path="src/utils/readUpload.js",
+        line_range=LineRange(start=11, end=13),
+        problem="Path traversal vulnerability: user-supplied filename is used without any sanitization.",
+        evidence="filename is joined through string concatenation.",
+        impact="A crafted ../ path can escape the intended directory.",
+        suggestion="Normalize with path.resolve and reject paths outside rootDir.",
+    )
+    board = BoardSummary(
+        finding_count=2,
+        finding_verifications={
+            first.finding_id: FindingVerification(finding_id=first.finding_id, status="supported"),
+            duplicate.finding_id: FindingVerification(finding_id=duplicate.finding_id, status="supported"),
+        },
+    )
+
+    presentation = agents.report_formatter_agent(
+        review_plan=ReviewPlan(changed_files=["src/utils/readUpload.js"]),
+        code_context=None,
+        reviewer_results=[],
+        findings=[first, duplicate],
+        board_summary=board,
+        evaluator_report=EvaluatorReport(
+            risk_level="critical",
+            confidence="high",
+            recommended_action="Block merge until fixed.",
+            reasoning="A critical finding has supporting evidence.",
+        ),
+        high_risk_review=None,
+        config=load_project_config(mock_llm=True),
+    )
+
+    assert "严重风险" in presentation.conclusion_summary
+    assert presentation.recommended_action == "暂缓合并，先修复高风险问题"
+    assert len(presentation.finding_rows) == 1
+    row = presentation.finding_rows[0]
+    assert row.finding_ids == ["finding_path_1", "finding_path_2"]
+    assert "路径穿越风险" in row.problem
+    assert "path.resolve" in row.suggestion

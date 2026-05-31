@@ -223,6 +223,14 @@ def load_project_config(
         api_key_env="DEEPSEEK_API_KEY",
         base_url_env="DEEPSEEK_BASE_URL",
     )
+    report_formatter = ModelSettings(
+        role="report_formatter",
+        provider="deepseek",
+        model=deepseek_model,
+        temperature=0.0,
+        api_key_env="DEEPSEEK_API_KEY",
+        base_url_env="DEEPSEEK_BASE_URL",
+    )
     high_risk = ModelSettings(
         role="high_risk_reviewer",
         provider="anthropic",
@@ -243,6 +251,7 @@ def load_project_config(
             "coverage_gap_agent": coverage_gap,
             "targeted_reviewer": targeted,
             "evaluator": evaluator,
+            "report_formatter": report_formatter,
             "high_risk_reviewer": high_risk,
         },
         mock_llm=mock_llm,

@@ -357,3 +357,32 @@ class HighRiskReviewReport(CodeCrossModel):
     analysis: str
     recommended_action: str
     blocking_findings: list[str] = Field(default_factory=list)
+
+
+class ReportFindingRow(CodeCrossModel):
+    """报告展示层的一行 finding。
+
+    Reviewer 原始输出仍保留在 ``Finding`` 里；这里是最后展示给 PR/前端的
+    本地化、去重和压缩结果。
+    """
+
+    finding_ids: list[str] = Field(default_factory=list)
+    severity: Severity
+    verification_status: str = ""
+    location: str = ""
+    problem: str = ""
+    suggestion: str = ""
+    source_reviewers: list[str] = Field(default_factory=list)
+
+
+class ReportPresentation(CodeCrossModel):
+    """最终报告展示层。
+
+    这个对象只负责“怎么说清楚”，不改变 Evaluator 的风险判断、Board 的证据状态
+    或 Reviewer 的原始 findings。
+    """
+
+    conclusion_summary: str = ""
+    recommended_action: str = ""
+    finding_rows: list[ReportFindingRow] = Field(default_factory=list)
+    formatter_notes: str = ""

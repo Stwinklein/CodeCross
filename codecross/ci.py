@@ -20,60 +20,26 @@ from typing import Any
 from pydantic import BaseModel
 
 from .config import ModelSettings, ProjectConfig, load_project_config
-from .schemas import CodeContext, Finding, ReviewerResult
+from .reporting import (
+    SEVERITY_LABELS,
+    build_default_report_presentation,
+    confidence_text,
+    context_counts,
+    merge_advice,
+    risk_text,
+    shorten,
+    stop_reason_text,
+    table_cell,
+    test_summary,
+    verification_counts,
+)
+from .schemas import Finding, ReportFindingRow, ReportPresentation, ReviewerResult
 from .workflow import CodeCrossState, run_workflow
 
 
 COMMENT_MARKER = "<!-- codecross-pr-review -->"
 DEFAULT_MAX_COMMENT_CHARS = 60_000
 DEFAULT_SUMMARY_FINDING_LIMIT = 10
-
-
-RISK_LABELS = {
-    "critical": "严重风险",
-    "high": "高风险",
-    "medium": "中风险",
-    "low": "低风险",
-    "unknown": "未知风险",
-}
-
-SEVERITY_LABELS = {
-    "critical": "严重",
-    "high": "高",
-    "medium": "中",
-    "low": "低",
-}
-
-CONFIDENCE_LABELS = {
-    "high": "高",
-    "medium": "中",
-    "low": "低",
-}
-
-VERIFICATION_LABELS = {
-    "supported": "已被证据支持",
-    "refuted": "已被测试反驳",
-    "unverified": "尚未验证",
-    "inconclusive": "证据不足",
-    "not_testable": "无法自动测试",
-}
-
-CONTEXT_KIND_LABELS = {
-    "changed_file": "变更文件",
-    "changed_hunk": "变更片段",
-    "symbol_definition": "符号定义",
-    "call_site": "调用点",
-    "existing_test": "现有测试",
-    "diagnostic": "诊断信息",
-}
-
-STOP_REASON_LABELS = {
-    "not stopped": "未提前停止",
-    "verification_queue_empty": "验证队列已清空",
-    "max_verification_rounds_reached": "达到最大验证轮次",
-    "no_verification_progress": "本轮验证没有新增进展",
-    "verification_queue_has_unresolved_targets": "仍有待验证目标",
-}
 
 
 @dataclass(slots=True)
@@ -167,159 +133,30 @@ def _model_label_from_state(state: CodeCrossState) -> str:
     return ", ".join(dict.fromkeys(labels)) or "未记录"
 
 
-def _context_counts(context: CodeContext | None) -> str:
-    """把上下文检索结果压缩成中文计数。
+def _render_report_findings_table(rows_to_render: list[ReportFindingRow], limit: int) -> str:
+    """Render formatter-agent finding rows into a compact Markdown table."""
 
-    CodeCross 的上下文检索会把 changed file、changed hunk、调用点、现有测试
-    等片段都放进 ``CodeContext.snippets``。PR 评论不适合贴全部代码，所以这里只
-    展示“拿到了哪些类型的上下文、各有多少段”，让读者快速判断 reviewer 是否看
-    到了足够材料。
-    """
-
-    if not context:
-        return "未检索到"
-    counts: dict[str, int] = {}
-    for snippet in context.snippets:
-        counts[snippet.kind] = counts.get(snippet.kind, 0) + 1
-    return ", ".join(
-        f"{CONTEXT_KIND_LABELS.get(kind, kind)} {count}"
-        for kind, count in sorted(counts.items())
-    ) or "未检索到"
-
-
-def _shorten(text: str, limit: int = 180) -> str:
-    """压缩长文本，避免 GitHub 表格单元格被大段模型输出撑爆。"""
-
-    cleaned = " ".join(text.split())
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[: limit - 1].rstrip() + "..."
-
-
-def _table_cell(text: str, limit: int = 180) -> str:
-    """渲染 Markdown 表格单元格前做最小转义。
-
-    LLM 输出里可能包含 ``|``，如果直接放进 GitHub Markdown 表格，会把一列拆成
-    多列，导致报告错位。这里先复用 ``_shorten`` 控制长度，再转义竖线；换行已经
-    在 ``_shorten`` 里被压成空格。
-    """
-
-    return _shorten(text, limit).replace("|", r"\|")
-
-
-def _severity_sort_key(finding: Finding) -> tuple[int, str]:
-    """按审查优先级排序，严重问题永远排在低风险问题前面。"""
-
-    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    return (severity_order.get(finding.severity, 9), finding.file_path)
-
-
-def _risk_text(risk_level: str) -> str:
-    """返回给用户看的中文风险等级，同时保留原始枚举方便排查。"""
-
-    label = RISK_LABELS.get(risk_level, risk_level)
-    return f"{label} (`{risk_level}`)"
-
-
-def _confidence_text(confidence: str) -> str:
-    """返回中文置信度；未知值直接透传，避免报告因为新枚举崩溃。"""
-
-    return CONFIDENCE_LABELS.get(confidence, confidence)
-
-
-def _verification_text(status: str) -> str:
-    """把 Board 的 finding verification 状态翻译成业务读者能理解的话。"""
-
-    return VERIFICATION_LABELS.get(status, status)
-
-
-def _stop_reason_text(stop_reason: str) -> str:
-    """把 evidence loop 的停止原因翻译成中文。
-
-    ``stop_reason`` 是内部调度信号，直接展示会比较像日志。这里保留原始值的
-    同时给出中文解释，方便以后你面试时讲清楚“验证循环为什么停下来”。
-    """
-
-    raw = stop_reason or "not stopped"
-    label = STOP_REASON_LABELS.get(raw, raw)
-    return f"{label} (`{raw}`)"
-
-
-def _merge_advice(risk_level: str) -> str:
-    """根据风险等级给出一眼可读的合并建议。
-
-    Evaluator 的 ``recommended_action`` 会在“建议动作”段落完整展示；看板第一行
-    只用规则给一个稳定、短句式的合并判断，避免模型长句把摘要表格撑开。
-    """
-
-    if risk_level in {"critical", "high"}:
-        return "暂缓合并，先修复高风险问题"
-    if risk_level == "medium":
-        return "建议修复或人工确认后再合并"
-    if risk_level == "low":
-        return "可以合并，但建议保留人工抽查"
-    return "风险未知，请先查看 CI 日志和完整产物"
-
-
-def _verification_counts(board: Any) -> str:
-    """统计每种 finding 验证状态的数量，帮助读者判断证据强弱。"""
-
-    if not board or not board.finding_verifications:
-        return "暂无验证状态"
-
-    counts: dict[str, int] = {}
-    for verification in board.finding_verifications.values():
-        counts[verification.status] = counts.get(verification.status, 0) + 1
-    return ", ".join(
-        f"{_verification_text(status)} {count}"
-        for status, count in sorted(counts.items())
-    )
-
-
-def _test_summary(board: Any) -> str:
-    """把测试执行结果浓缩成一句中文摘要。"""
-
-    if not board:
-        return "未生成测试执行摘要"
-    return (
-        f"通过 {board.passed_count}，失败 {board.failed_count}，"
-        f"错误/阻塞 {board.error_count}，跳过 {board.skipped_count}"
-    )
-
-
-def _render_findings_table(findings: list[Finding], board: Any, limit: int) -> str:
-    """渲染最重要的 findings。
-
-    表格只展示前 ``limit`` 条，是为了让 PR 首页评论保持可读；完整 JSON 仍会作为
-    CI artifact 上传。验证状态来自 Review Board，而不是 reviewer 自己判断，这
-    能体现 CodeCross “reviewer 提假设、board 管证据”的核心设计。
-    """
-
-    if not findings:
+    if not rows_to_render:
         return "Reviewer 没有产出 finding。"
 
     rows = [
         "| 严重级别 | 验证状态 | 位置 | 问题 | 建议 |",
         "| --- | --- | --- | --- | --- |",
     ]
-    verifications = board.finding_verifications if board else {}
-    for finding in sorted(findings, key=_severity_sort_key)[:limit]:
-        line = finding.line_range.start
-        file_label = finding.file_path if line is None else f"{finding.file_path}:{line}"
-        verification = verifications.get(finding.finding_id)
-        verification_status = (
-            _verification_text(verification.status) if verification else "未进入验证"
-        )
+    for row in rows_to_render[:limit]:
+        problem = row.problem
+        if len(row.finding_ids) > 1:
+            problem += f"（已合并 {len(row.finding_ids)} 条相近发现）"
         rows.append(
             "| "
-            f"{SEVERITY_LABELS.get(finding.severity, finding.severity)} | "
-            f"{verification_status} | "
-            f"`{file_label}` | "
-            f"{_table_cell(finding.problem)} | "
-            f"{_table_cell(finding.suggestion)} |"
+            f"{SEVERITY_LABELS.get(row.severity, row.severity)} | "
+            f"{row.verification_status or '未进入验证'} | "
+            f"`{row.location or '未知位置'}` | "
+            f"{table_cell(problem)} | "
+            f"{table_cell(row.suggestion)} |"
         )
 
-    remaining = len(findings) - limit
+    remaining = len(rows_to_render) - limit
     if remaining > 0:
         rows.append(f"\n_还有 {remaining} 条 finding 在完整 CI artifact 里。_")
     return "\n".join(rows)
@@ -332,7 +169,7 @@ def _reviewer_error_block(state: CodeCrossState) -> str:
     for result in state.get("reviewer_results", []):
         if result.errors:
             joined = "; ".join(result.errors)
-            lines.append(f"- `{result.reviewer_name}`: {_shorten(joined, 260)}")
+            lines.append(f"- `{result.reviewer_name}`: {shorten(joined, 260)}")
     if not lines:
         return ""
     return "\n\n**Reviewer 错误**\n" + "\n".join(lines)
@@ -364,10 +201,11 @@ def build_pr_comment(
     CodeCross 评论并原地更新。这样同一个 PR 多次 push 时，只会保留一条最新报告，
     不会在对话区刷出一长串重复评论。
 
-    报告结构刻意分成三层：
+    报告结构刻意分成四层：
     1. “结论看板”让 reviewer、作者和面试官都能一眼看到风险与合并建议。
-    2. “变更与上下文”说明模型到底看到了哪些文件、符号和检索上下文。
-    3. “重点问题”只列最重要 findings，完整细节仍保存在 JSON artifact。
+    2. “结论摘要”把表格压缩成人能直接转述的中文结论。
+    3. “变更与上下文”说明模型到底看到了哪些文件、符号和检索上下文。
+    4. “重点问题”只列最重要 findings，完整细节仍保存在 JSON artifact。
     """
 
     metadata = metadata or PullRequestMetadata()
@@ -379,10 +217,20 @@ def build_pr_comment(
     board = state.get("board_summary")
     evaluator = state.get("evaluator_report")
     findings: list[Finding] = state.get("findings", [])
+    raw_presentation = state.get("report_presentation")
+    presentation = (
+        ReportPresentation.model_validate(raw_presentation)
+        if raw_presentation
+        else build_default_report_presentation(
+            findings=findings,
+            board_summary=board,
+            evaluator_report=evaluator,
+            high_risk_review=state.get("high_risk_review"),
+        )
+    )
 
     risk_level = evaluator.risk_level if evaluator else "unknown"
     confidence = evaluator.confidence if evaluator else "medium"
-    recommended_action = evaluator.recommended_action if evaluator else "请人工查看 CI artifact。"
     changed_files = ", ".join(plan.changed_files[:12]) if plan else "无"
     if plan and len(plan.changed_files) > 12:
         changed_files += f", ... (+{len(plan.changed_files) - 12})"
@@ -399,42 +247,49 @@ def build_pr_comment(
         "",
         "| 项目 | 结果 |",
         "| --- | --- |",
-        f"| 风险等级 | **{_risk_text(risk_level)}** |",
-        f"| 合并建议 | **{_merge_advice(risk_level)}** |",
-        f"| 置信度 | {_confidence_text(confidence)} |",
+        f"| 风险等级 | **{risk_text(risk_level)}** |",
+        f"| 合并建议 | **{merge_advice(risk_level)}** |",
+        f"| 置信度 | {confidence_text(confidence)} |",
         f"| 运行模式 | {mode_label} |",
-        f"| Reviewer 模型 | {_model_label_from_state(state)} |",
+        f"| 审查模型 | {_model_label_from_state(state)} |",
     ]
     if metadata.head_sha:
-        lines.append(f"| Commit | `{metadata.head_sha[:12]}` |")
+        lines.append(f"| 提交 | `{metadata.head_sha[:12]}` |")
     if metadata.workflow_url:
         lines.append(f"| CI 运行 | [打开 Actions 运行]({metadata.workflow_url}) |")
     if board:
         lines.extend(
             [
-                f"| Findings | {board.finding_count} |",
-                f"| 测试结果 | {_test_summary(board)} |",
-                f"| 验证状态 | {_verification_counts(board)} |",
-                f"| 验证停止原因 | {_stop_reason_text(board.stop_reason)} |",
+                f"| 问题数 | {board.finding_count} |",
+                f"| 测试结果 | {test_summary(board)} |",
+                f"| 验证状态 | {verification_counts(board)} |",
+                f"| 验证停止原因 | {stop_reason_text(board.stop_reason)} |",
             ]
         )
 
     lines.extend(
         [
             "",
+            "### 结论摘要",
+            "",
+            presentation.conclusion_summary,
+            "",
             "### 建议动作",
             "",
-            recommended_action,
+            presentation.recommended_action,
             "",
             "### 变更与上下文",
             "",
             f"- 变更文件：{changed_files or '无'}",
             f"- 变更符号：{changed_symbols or '无'}",
-            f"- 检索到的上下文：{_context_counts(context)}",
+            f"- 检索到的上下文：{context_counts(context)}",
             "",
             "### 重点问题",
             "",
-            _render_findings_table(findings, board, DEFAULT_SUMMARY_FINDING_LIMIT),
+            _render_report_findings_table(
+                presentation.finding_rows,
+                DEFAULT_SUMMARY_FINDING_LIMIT,
+            ),
             _reviewer_error_block(state),
             "",
             "---",
@@ -461,6 +316,7 @@ def _required_settings_for_ci(config: ProjectConfig) -> list[ModelSettings]:
         "test_result_analyzer",
         "coverage_gap_agent",
         "evaluator",
+        "report_formatter",
     }
     settings = [
         setting

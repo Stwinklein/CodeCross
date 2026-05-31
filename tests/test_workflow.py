@@ -30,5 +30,7 @@ def test_workflow_runs_v1_demo_with_two_reviewers():
     )
     assert result["evaluator_report"].risk_level == "high"
     assert result["high_risk_review"] is not None
+    assert result["report_presentation"].conclusion_summary
+    assert "报告展示层" in result["final_report"]
     assert "CodeCross V1 Report" in result["final_report"]
     assert "## 代码上下文" in result["final_report"]

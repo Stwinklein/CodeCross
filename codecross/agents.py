@@ -19,6 +19,7 @@ from .board import render_board_markdown
 from .config import ModelSettings, ProjectConfig
 from .context import retrieve_code_context
 from .llm import ModelCallError, call_model_json, json_schema_instruction
+from .reporting import build_default_report_presentation, normalize_report_presentation
 from .schemas import (
     BoardSummary,
     CodeContext,
@@ -26,6 +27,7 @@ from .schemas import (
     Finding,
     HighRiskReviewReport,
     LineRange,
+    ReportPresentation,
     ReviewPlan,
     ReviewerResult,
     TargetedReview,
@@ -1060,6 +1062,62 @@ def high_risk_review_agent(
         )
 
 
+def report_formatter_agent(
+    *,
+    review_plan: ReviewPlan,
+    code_context: CodeContext | None,
+    reviewer_results: list[ReviewerResult],
+    findings: list[Finding],
+    board_summary: BoardSummary,
+    evaluator_report: EvaluatorReport,
+    high_risk_review: HighRiskReviewReport | None,
+    config: ProjectConfig,
+) -> ReportPresentation:
+    """Report Formatter：只负责最终展示，不改变风险裁决和证据状态。"""
+
+    fallback = build_default_report_presentation(
+        findings=findings,
+        board_summary=board_summary,
+        evaluator_report=evaluator_report,
+        high_risk_review=high_risk_review,
+    )
+    settings = config.model_config.get("report_formatter")
+    if config.mock_llm or not settings:
+        return fallback
+
+    try:
+        presentation = call_model_json(
+            settings,
+            [
+                (
+                    "system",
+                    "You are CodeCross Report Formatter. Translate and polish the final PR report "
+                    "in Simplified Chinese. Do not change the evaluator risk level, verification "
+                    "statuses, file locations, or finding IDs. Merge near-duplicate findings only "
+                    "when they refer to the same issue. Keep fields concise and do not put Markdown "
+                    "tables inside JSON fields.",
+                ),
+                (
+                    "user",
+                    f"Review plan:\n{review_plan.model_dump_json(indent=2)}\n\n"
+                    f"Code context summary:\n{code_context.model_dump_json(indent=2) if code_context else 'none'}\n\n"
+                    f"Reviewer results:\n{_json([result.model_dump() for result in reviewer_results])}\n\n"
+                    f"Findings:\n{_json([finding.model_dump() for finding in findings])}\n\n"
+                    f"Board summary:\n{board_summary.model_dump_json(indent=2)}\n\n"
+                    f"Evaluator report:\n{evaluator_report.model_dump_json(indent=2)}\n\n"
+                    f"High risk review:\n{high_risk_review.model_dump_json(indent=2) if high_risk_review else 'none'}\n\n"
+                    f"Deterministic fallback presentation to preserve facts:\n"
+                    f"{fallback.model_dump_json(indent=2)}\n\n"
+                    f"{json_schema_instruction(ReportPresentation)}",
+                ),
+            ],
+            ReportPresentation,
+        )
+        return normalize_report_presentation(presentation, fallback)  # type: ignore[arg-type]
+    except ModelCallError:
+        return fallback
+
+
 def render_final_report(
     *,
     review_plan: ReviewPlan,
@@ -1067,6 +1125,7 @@ def render_final_report(
     board_summary: BoardSummary,
     evaluator_report: EvaluatorReport,
     high_risk_review: HighRiskReviewReport | None,
+    report_presentation: ReportPresentation | None = None,
     code_context: CodeContext | None = None,
 ) -> str:
     """把 workflow 的关键结果汇总成 Markdown 报告。"""
@@ -1111,6 +1170,23 @@ def render_final_report(
             f"- 未能读取的文件：{', '.join(code_context.missing_files) or '无'}\n\n"
         )
 
+    presentation_section = ""
+    if report_presentation:
+        finding_lines = [
+            (
+                f"- [{row.verification_status or '未进入验证'}] "
+                f"{row.location or '未知位置'}：{row.problem} 建议：{row.suggestion}"
+            )
+            for row in report_presentation.finding_rows[:10]
+        ]
+        presentation_section = (
+            "\n## 报告展示层\n\n"
+            f"{report_presentation.conclusion_summary}\n\n"
+            f"建议动作：{report_presentation.recommended_action or '无'}\n\n"
+            + ("\n".join(finding_lines) if finding_lines else "无重点问题。")
+            + "\n\n"
+        )
+
     return (
         "# CodeCross V1 Report / 最终审查报告\n\n"
         f"## 风险结论\n\n"
@@ -1124,6 +1200,7 @@ def render_final_report(
         f"- 风险方向：{', '.join(review_plan.risk_areas) or '无'}\n"
         f"- 测试重点：{', '.join(review_plan.testing_focus) or '无'}\n\n"
         + context_section
+        + presentation_section
         + "## Reviewer 输出\n\n"
         + "\n\n".join(reviewer_sections)
         + "\n\n"

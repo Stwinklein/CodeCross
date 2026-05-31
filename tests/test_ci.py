@@ -22,6 +22,8 @@ from codecross.schemas import (
     Finding,
     FindingVerification,
     LineRange,
+    ReportFindingRow,
+    ReportPresentation,
     ReviewPlan,
     ReviewerResult,
 )
@@ -114,6 +116,33 @@ def test_build_pr_comment_contains_marker_summary_and_findings():
     assert "abcdef123456" in comment
     assert "deepseek/deepseek-chat" in comment
     assert "API Key 和 Base URL" in comment
+
+
+def test_build_pr_comment_uses_formatter_presentation():
+    """CI comment should render the final formatter output instead of raw reviewer prose."""
+
+    state = _sample_state()
+    state["report_presentation"] = ReportPresentation(
+        conclusion_summary="本次 PR 由报告格式化节点整理为中文结论。",
+        recommended_action="先修复格式化节点列出的阻断问题。",
+        finding_rows=[
+            ReportFindingRow(
+                finding_ids=["finding_a", "finding_b"],
+                severity="high",
+                verification_status="已被证据支持",
+                location="src/app.py:12",
+                problem="格式化后的中文问题",
+                suggestion="格式化后的中文建议",
+            )
+        ],
+    )
+
+    comment = build_pr_comment(state)
+
+    assert "### 结论摘要" in comment
+    assert "本次 PR 由报告格式化节点整理为中文结论。" in comment
+    assert "格式化后的中文问题（已合并 2 条相近发现）" in comment
+    assert "The new branch can return None" not in comment
 
 
 def test_build_pr_comment_handles_empty_state():
