@@ -26,6 +26,7 @@ from .reporting import (
     confidence_text,
     context_counts,
     merge_advice,
+    needs_chinese_fallback,
     risk_text,
     shorten,
     stop_reason_text,
@@ -142,7 +143,7 @@ def _render_report_findings_table(rows_to_render: list[ReportFindingRow], limit:
         if "反驳" not in (row.verification_status or "")
     ]
     if not rows_to_render:
-        return "当前没有剩余已被证据支持或待人工确认的重点问题；已被测试反驳的 finding 保留在完整 CI artifact 中。"
+        return "当前没有剩余已被证据支持或待人工确认的重点问题；已被测试反驳的问题保留在完整 CI 产物中。"
 
     rows = [
         "| 严重级别 | 验证状态 | 位置 | 问题 | 建议 |",
@@ -163,8 +164,36 @@ def _render_report_findings_table(rows_to_render: list[ReportFindingRow], limit:
 
     remaining = len(rows_to_render) - limit
     if remaining > 0:
-        rows.append(f"\n_还有 {remaining} 条 finding 在完整 CI artifact 里。_")
+        rows.append(f"\n_还有 {remaining} 条问题在完整 CI 产物里。_")
     return "\n".join(rows)
+
+
+def _looks_like_code_symbol(value: str) -> bool:
+    """Keep identifiers visible, but hide English prose from the PR summary."""
+
+    value = (value or "").strip()
+    if not value:
+        return False
+    return " " not in value and len(value) <= 80
+
+
+def _display_changed_symbols(symbols: list[str] | None) -> str:
+    """Render changed symbols without turning planner English prose into UI copy."""
+
+    if not symbols:
+        return "无"
+    visible = [
+        symbol
+        for symbol in symbols[:16]
+        if not needs_chinese_fallback(symbol) or _looks_like_code_symbol(symbol)
+    ]
+    hidden = len(symbols) - len(visible)
+    if visible:
+        rendered = ", ".join(visible)
+        if hidden > 0:
+            rendered += f"，另有 {hidden} 条变更说明见 CI 产物"
+        return rendered
+    return f"{len(symbols)} 条变更说明，完整列表见 CI 产物"
 
 
 def _reviewer_error_block(state: CodeCrossState) -> str:
@@ -173,11 +202,13 @@ def _reviewer_error_block(state: CodeCrossState) -> str:
     lines: list[str] = []
     for result in state.get("reviewer_results", []):
         if result.errors:
-            joined = "; ".join(result.errors)
-            lines.append(f"- `{result.reviewer_name}`: {shorten(joined, 260)}")
+            lines.append(
+                f"- `{result.reviewer_name}`: 审查器返回结果无法解析，"
+                "本次已降级使用其他审查结果；完整错误见 CI 产物。"
+            )
     if not lines:
         return ""
-    return "\n\n**Reviewer 错误**\n" + "\n".join(lines)
+    return "\n\n**审查器错误**\n" + "\n".join(lines)
 
 
 def truncate_comment(markdown: str, max_chars: int) -> str:
@@ -187,7 +218,7 @@ def truncate_comment(markdown: str, max_chars: int) -> str:
         return markdown
     suffix = (
         "\n\n---\n"
-        "_评论内容已截断，以避免超过 GitHub 评论长度限制。完整结果请查看 CI artifact。_\n"
+        "_评论内容已截断，以避免超过 GitHub 评论长度限制。完整结果请查看 CI 产物。_\n"
     )
     budget = max(max_chars - len(suffix), len(COMMENT_MARKER) + 32)
     return markdown[:budget].rstrip() + suffix
@@ -234,9 +265,7 @@ def build_pr_comment(
     changed_files = ", ".join(plan.changed_files[:12]) if plan else "无"
     if plan and len(plan.changed_files) > 12:
         changed_files += f", ... (+{len(plan.changed_files) - 12})"
-    changed_symbols = ", ".join(plan.changed_symbols[:16]) if plan else "无"
-    if plan and len(plan.changed_symbols) > 16:
-        changed_symbols += f", ... (+{len(plan.changed_symbols) - 16})"
+    changed_symbols = _display_changed_symbols(plan.changed_symbols if plan else None)
 
     mode_label = "演示/Mock 模式" if mock_llm else "真实模型模式"
     lines = [

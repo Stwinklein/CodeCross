@@ -97,8 +97,12 @@ def _sample_state() -> dict:
 def test_build_pr_comment_contains_marker_summary_and_findings():
     """The PR comment should be stable, compact, and useful at a glance."""
 
+    state = _sample_state()
+    state["review_plan"].changed_symbols.append("checkout_codecross step: removed continue-on-error")
+    state["reviewer_results"][0].errors.append("ModelCallError: invalid JSON")
+
     comment = build_pr_comment(
-        _sample_state(),
+        state,
         metadata=PullRequestMetadata(
             repository="owner/repo",
             pr_number=7,
@@ -115,6 +119,10 @@ def test_build_pr_comment_contains_marker_summary_and_findings():
     assert "abcdef123456" in comment
     assert "deepseek/deepseek-chat" in comment
     assert "API Key 和 Base URL" in comment
+    assert "checkout_codecross step: removed continue-on-error" not in comment
+    assert "另有 1 条变更说明见 CI 产物" in comment
+    assert "ModelCallError" not in comment
+    assert "审查器返回结果无法解析" in comment
 
 
 def test_build_pr_comment_handles_empty_state():
@@ -165,7 +173,7 @@ def test_default_presentation_keeps_unknown_findings_actionable_without_placehol
     supported = Finding(
         source_reviewer="logic_reviewer",
         model="deepseek/deepseek-chat",
-        category="security",
+        category="security-env-injection",
         severity="medium",
         file_path=".github/workflows/codecross-pr-review.yml",
         line_range=LineRange(start=56, end=64),
@@ -214,8 +222,11 @@ def test_default_presentation_keeps_unknown_findings_actionable_without_placehol
     row = presentation.finding_rows[0]
     assert row.finding_ids == [supported.finding_id]
     assert "未能稳定中文化" not in row.problem
-    assert "security风险需要人工复核" not in row.problem
-    assert "安全风险需要人工复核" in row.problem
+    assert "security-env-injection" not in row.problem
+    assert "Shell command interpolates" not in row.problem
+    assert "Keep values in environment variables" not in row.suggestion
+    assert "安全校验风险需要人工复核" in row.problem
+    assert "原始修复建议" not in row.suggestion
     assert "fs.readFileSync" not in row.problem
 
 

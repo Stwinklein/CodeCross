@@ -75,6 +75,22 @@ CATEGORY_LABELS = {
     "security": "安全",
 }
 
+CATEGORY_KEYWORD_LABELS = [
+    (("workflow", "failure"), "CI 失败处理"),
+    (("failure", "handling"), "失败处理"),
+    (("fallback",), "兜底逻辑"),
+    (("heredoc",), "兜底评论格式"),
+    (("indentation",), "格式缩进"),
+    (("security", "injection"), "安全校验"),
+    (("env", "injection"), "环境变量安全"),
+    (("api", "design"), "接口设计"),
+    (("boundary",), "边界条件"),
+    (("logic",), "逻辑"),
+    (("runtime",), "运行时"),
+    (("maintain",), "可维护性"),
+    (("performance",), "性能"),
+]
+
 COMMON_FINDING_TRANSLATIONS = [
     (
         ("path traversal",),
@@ -160,6 +176,24 @@ def polish_report_terms(text: str) -> str:
     polished = re.sub(r"\b[Ff]inding\b", "问题", polished)
     polished = re.sub(r"\b[Rr]eviewer\b", "审查器", polished)
     return re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", polished)
+
+
+def category_text(category: str | None) -> str:
+    """Return a Chinese category label without leaking raw English taxonomy."""
+
+    raw = (category or "").strip()
+    if not raw:
+        return "代码"
+    if raw in CATEGORY_LABELS:
+        return CATEGORY_LABELS[raw]
+
+    lowered = raw.lower().replace("_", "-")
+    for keywords, label in CATEGORY_KEYWORD_LABELS:
+        if all(keyword in lowered for keyword in keywords):
+            return label
+    if needs_chinese_fallback(raw):
+        return "代码"
+    return raw
 
 
 def shorten(text: str, limit: int = 180) -> str:
@@ -262,11 +296,11 @@ def severity_sort_key(finding: Finding) -> tuple[int, str]:
 
 
 def _manual_review_problem(finding: Finding) -> str:
-    category = CATEGORY_LABELS.get(finding.category, finding.category or "代码")
-    detail = finding.problem or finding.evidence or finding.impact
-    if detail:
-        return f"{category}风险需要人工复核：{shorten(detail, 150)}"
-    return f"{category}风险需要人工复核。"
+    category = category_text(finding.category)
+    return (
+        f"{category}风险需要人工复核：该位置已被审查器标记为风险点，"
+        "请结合变更片段、验证状态和项目语义确认实际影响。"
+    )
 
 
 def _fallback_problem(finding: Finding) -> str:
@@ -274,11 +308,11 @@ def _fallback_problem(finding: Finding) -> str:
 
 
 def _fallback_suggestion(finding: Finding) -> str:
-    category = CATEGORY_LABELS.get(finding.category, finding.category or "相关")
-    detail = finding.suggestion or finding.impact
-    if detail:
-        return f"先按{category}风险人工复核该位置；原始修复建议：{shorten(detail, 150)}"
-    return f"先按{category}风险人工复核该位置，补充必要测试，修复后重新运行 CodeCross。"
+    category = category_text(finding.category)
+    return (
+        f"先按{category}风险人工复核该位置；补充必要的保护逻辑和回归测试，"
+        "确认后重新运行 CodeCross。"
+    )
 
 
 def _common_finding_translation(finding: Finding) -> tuple[str, str] | None:
@@ -304,11 +338,15 @@ def localized_finding_text(finding: Finding) -> tuple[str, str]:
     if translation:
         return translation
 
-    problem = _fallback_problem(finding) if needs_chinese_fallback(finding.problem) else finding.problem
+    problem = (
+        _fallback_problem(finding)
+        if not finding.problem or needs_chinese_fallback(finding.problem)
+        else polish_report_terms(finding.problem)
+    )
     suggestion = (
         _fallback_suggestion(finding)
-        if needs_chinese_fallback(finding.suggestion)
-        else finding.suggestion
+        if not finding.suggestion or needs_chinese_fallback(finding.suggestion)
+        else polish_report_terms(finding.suggestion)
     )
     return problem, suggestion
 
