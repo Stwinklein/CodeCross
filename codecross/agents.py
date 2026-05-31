@@ -19,7 +19,15 @@ from .board import render_board_markdown
 from .config import ModelSettings, ProjectConfig
 from .context import retrieve_code_context
 from .llm import ModelCallError, call_model_json, json_schema_instruction
-from .reporting import build_default_report_presentation
+from .reporting import (
+    build_default_report_presentation,
+    category_text,
+    confidence_text,
+    merge_advice,
+    needs_chinese_fallback,
+    polish_report_terms,
+    risk_text,
+)
 from .schemas import (
     BoardSummary,
     CodeContext,
@@ -1061,6 +1069,56 @@ def high_risk_review_agent(
         )
 
 
+_FINAL_REPORT_TERM_LABELS = {
+    "boundary conditions": "边界条件",
+    "command injection": "命令注入",
+    "edge cases and exception paths": "覆盖边界条件和异常路径",
+    "exception flow": "异常流程",
+    "high severity findings first": "优先验证高严重度问题",
+    "logic correctness": "逻辑正确性",
+    "pytest evidence for reproducible issues": "用 pytest 固化可复现证据",
+    "regression risk": "回归风险",
+    "secret handling": "密钥处理",
+}
+
+
+def _localized_report_text(text: str, fallback: str) -> str:
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        return fallback
+
+    mapped = _FINAL_REPORT_TERM_LABELS.get(cleaned.lower())
+    if mapped:
+        return mapped
+    if needs_chinese_fallback(cleaned):
+        return fallback
+    return polish_report_terms(cleaned)
+
+
+def _localized_report_list(items: list[str], *, empty: str = "无") -> str:
+    visible: list[str] = []
+    hidden_count = 0
+    for item in items:
+        cleaned = " ".join((item or "").split())
+        if not cleaned:
+            continue
+
+        mapped = _FINAL_REPORT_TERM_LABELS.get(cleaned.lower())
+        if not mapped:
+            mapped = category_text(cleaned)
+            if mapped == "代码" and needs_chinese_fallback(cleaned):
+                hidden_count += 1
+                continue
+            if mapped == cleaned:
+                mapped = polish_report_terms(cleaned)
+        if mapped not in visible:
+            visible.append(mapped)
+
+    if hidden_count:
+        visible.append(f"{hidden_count} 项原始计划已保留在结构化 JSON 产物中")
+    return ", ".join(visible) if visible else empty
+
+
 def render_final_report(
     *,
     review_plan: ReviewPlan,
@@ -1076,6 +1134,10 @@ def render_final_report(
     # test_intent 和错误对象已经在结构化 state 中，前端或 JSON artifact 可以展开。
     reviewer_sections: list[str] = []
     for result in reviewer_results:
+        reviewer_notes = _localized_report_text(
+            result.reviewer_notes,
+            "审查器原始备注已保留在结构化 JSON 产物中。",
+        )
         reviewer_sections.append(
             "\n".join(
                 [
@@ -1084,7 +1146,7 @@ def render_final_report(
                     f"- 发现数：{len(result.findings)}",
                     f"- 测试意图：{len(result.test_intents)}",
                     f"- 错误数：{len(result.errors)}",
-                    result.reviewer_notes or "无额外备注。",
+                    reviewer_notes,
                 ]
             )
         )
@@ -1093,11 +1155,20 @@ def render_final_report(
     # 因此这里先准备空字符串，避免低风险 PR 报告里出现空标题。
     high_risk_section = ""
     if high_risk_review:
+        blocking = ", ".join(high_risk_review.blocking_findings) or "无"
+        high_risk_analysis = _localized_report_text(
+            high_risk_review.analysis,
+            "高风险二次确认已完成；原始复核细节已保留在结构化 JSON 产物中，最终结论以本报告的结论摘要和重点问题为准。",
+        )
+        high_risk_action = _localized_report_text(
+            high_risk_review.recommended_action,
+            merge_advice(evaluator_report.risk_level),
+        )
         high_risk_section = (
             "\n## 高风险二次确认\n\n"
-            f"{high_risk_review.analysis}\n\n"
-            f"建议动作：{high_risk_review.recommended_action}\n\n"
-            f"阻断级 findings：{', '.join(high_risk_review.blocking_findings) or '无'}\n"
+            f"{high_risk_analysis}\n\n"
+            f"建议动作：{high_risk_action}\n\n"
+            f"阻断级问题：{blocking}\n"
         )
 
     context_section = ""
@@ -1139,19 +1210,31 @@ def render_final_report(
         + ("\n".join(finding_lines) if finding_lines else "无剩余重点问题。")
         + "\n\n"
     )
+    risk_reasoning = _localized_report_text(
+        evaluator_report.reasoning,
+        "风险判断来自已收集的测试结果、验证状态和审查器发现。",
+    )
+    evidence_summary = _localized_report_text(
+        evaluator_report.evidence_summary,
+        "完整证据摘要已保留在结构化 JSON 产物中；报告上方已汇总测试和验证状态。",
+    )
+    failed_tests_summary = _localized_report_text(
+        evaluator_report.failed_tests_summary,
+        "没有失败测试详情。",
+    )
 
     return (
         "# CodeCross 最终审查报告\n\n"
         f"## 风险结论\n\n"
-        f"- 风险等级：{evaluator_report.risk_level}\n"
-        f"- 置信度：{evaluator_report.confidence}\n"
-        f"- 判断理由：{evaluator_report.reasoning}\n"
-        f"- 建议动作：{evaluator_report.recommended_action}\n\n"
+        f"- 风险等级：{risk_text(evaluator_report.risk_level)}\n"
+        f"- 置信度：{confidence_text(evaluator_report.confidence)}\n"
+        f"- 判断理由：{risk_reasoning}\n"
+        f"- 建议动作：{presentation.recommended_action or merge_advice(evaluator_report.risk_level)}\n\n"
         "## 审查计划\n\n"
         f"- 变更文件：{', '.join(review_plan.changed_files) or '无'}\n"
         f"- 变更符号：{', '.join(review_plan.changed_symbols) or '无'}\n"
-        f"- 风险方向：{', '.join(review_plan.risk_areas) or '无'}\n"
-        f"- 测试重点：{', '.join(review_plan.testing_focus) or '无'}\n\n"
+        f"- 风险方向：{_localized_report_list(review_plan.risk_areas)}\n"
+        f"- 测试重点：{_localized_report_list(review_plan.testing_focus)}\n\n"
         + context_section
         + presentation_section
         + "## Reviewer 输出\n\n"
@@ -1159,7 +1242,7 @@ def render_final_report(
         + "\n\n"
         + render_board_markdown(board_summary)
         + "\n## 证据摘要\n\n"
-        f"{evaluator_report.evidence_summary}\n\n"
-        f"{evaluator_report.failed_tests_summary or '没有失败测试详情。'}\n"
+        f"{evidence_summary}\n\n"
+        f"{failed_tests_summary}\n"
         + high_risk_section
     )

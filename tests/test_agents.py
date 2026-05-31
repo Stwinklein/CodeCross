@@ -10,6 +10,7 @@ from codecross.schemas import (
     EvaluatorReport,
     Finding,
     FindingVerification,
+    HighRiskReviewReport,
     LineRange,
     ReviewPlan,
     ReviewerResult,
@@ -213,13 +214,18 @@ def test_final_report_localizes_and_deduplicates_findings():
     )
 
     report = agents.render_final_report(
-        review_plan=ReviewPlan(changed_files=["src/utils/readUpload.js"]),
+        review_plan=ReviewPlan(
+            changed_files=["src/utils/readUpload.js"],
+            risk_areas=["secret handling", "regression risk"],
+            testing_focus=["high severity findings first", "pytest evidence for reproducible issues"],
+        ),
         code_context=None,
         reviewer_results=[
             ReviewerResult(
                 reviewer_name="logic_reviewer",
                 model="deepseek/mock",
                 findings=[first],
+                reviewer_notes="Reviewer identified a blocking issue.",
             ),
             ReviewerResult(
                 reviewer_name="security_maintainability_reviewer",
@@ -233,8 +239,14 @@ def test_final_report_localizes_and_deduplicates_findings():
             confidence="high",
             recommended_action="Block merge until fixed.",
             reasoning="A critical finding has supporting evidence.",
+            evidence_summary="Tests and reviewers indicate a critical failure.",
+            failed_tests_summary="The generated regression test fails before the fix.",
         ),
-        high_risk_review=None,
+        high_risk_review=HighRiskReviewReport(
+            analysis="High risk review confirms the finding is blocking.",
+            recommended_action="Do not merge until the path traversal is fixed.",
+            blocking_findings=[first.finding_id],
+        ),
     )
 
     assert "CodeCross 最终审查报告" in report
@@ -243,4 +255,11 @@ def test_final_report_localizes_and_deduplicates_findings():
     assert "路径穿越风险" in report
     assert "已合并" in report
     assert "path.resolve" in report
+    assert "优先验证高严重度问题" in report
+    assert "高风险二次确认已完成" in report
     assert "Path traversal vulnerability" not in report
+    assert "Block merge until fixed" not in report
+    assert "A critical finding has supporting evidence" not in report
+    assert "Reviewer identified a blocking issue" not in report
+    assert "High risk review confirms" not in report
+    assert "Tests and reviewers indicate" not in report
