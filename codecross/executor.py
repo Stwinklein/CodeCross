@@ -163,15 +163,15 @@ def low_value_test_reason(test_case: TestCase) -> str:
     """返回测试缺乏证据价值的原因；空字符串表示可以执行。
 
     这里故意不要求测试一定 import 目标模块，因为有些非 Python 项目可以通过读取
-    源文件做静态验证。但至少要有真实断言、`pytest.raises`，且不能出现明显的
-    placeholder 文案。
+    源文件做静态验证。但至少要有真实断言或 `pytest.raises`。
     """
 
     try:
         tree = ast.parse(test_case.test_code)
     except SyntaxError:
-        # 语法错误交给安全检查处理，那里会返回 unsafe。
-        return ""
+        # execute_pytest_case 会先走安全检查；这里仍返回明确原因，方便单独调用
+        # low_value_test_reason 时不会把语法错误误读成“有证据价值”。
+        return "syntax_error_uninspectable"
 
     visitor = TestValueVisitor()
     visitor.visit(tree)
@@ -199,10 +199,10 @@ def _contains_blocked_command_marker(text: str, command: str) -> bool:
     marker = command.strip().lower()
     if not marker:
         return False
-    escaped = re.escape(marker)
+    escaped = r"\s+".join(re.escape(part) for part in marker.split())
     if re.search(r"^[a-z0-9_.-]+$", marker):
         return re.search(rf"(?<![\w.-]){escaped}(?![\w.-])", text) is not None
-    return marker in text
+    return re.search(rf"(?<![\w.-]){escaped}(?![\w.-])", text) is not None
 
 
 def _open_call_writes(call: ast.Call) -> bool:
@@ -560,12 +560,9 @@ def execute_test_cases(
 
     results: list[TestResult] = []
     # select_next_verification_targets 已经限制了“本轮最多验证多少 finding”。
-    # Test Author 可能会再加正常路径对照用例，所以 executor 给实际测试数留出 2 倍余量；
-    # 超出余量的测试会显式标记 skipped，而不是静默丢失。
-    execution_limit = max(
-        runner_config.max_tests_per_round,
-        runner_config.max_tests_per_round * 2,
-    )
+    # Test Author 可能会再加正常路径对照用例，所以 executor 最多执行 2 倍测试数；
+    # 超出预算的测试会显式标记 skipped，而不是静默丢失。
+    execution_limit = runner_config.max_tests_per_round * 2
     for test_case in test_cases[:execution_limit]:
         # static_check 的 test_code 仍然是 Python/pytest 代码，只是语义上表示
         # “读源码做静态断言”。WebAPI 这类 JS 项目短期就靠它提供可执行证据。
