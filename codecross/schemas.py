@@ -385,4 +385,4 @@ class ReportPresentation(CodeCrossModel):
     conclusion_summary: str = ""
     recommended_action: str = ""
     finding_rows: list[ReportFindingRow] = Field(default_factory=list)
-    formatter_notes: str = ""
+    presentation_notes: str = ""

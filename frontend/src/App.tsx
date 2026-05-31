@@ -483,7 +483,7 @@ const executionEvents: LogRow[] = [
     nodeId: "final_report",
     actor: "Report",
     kind: "done",
-    message: "生成 CodeCross V1 Report",
+    message: "生成 CodeCross 最终审查报告",
   },
 ];
 
@@ -2407,7 +2407,7 @@ function exportRun(format: "json" | "markdown", runId: string, logs: LogRow[]) {
   const content =
     format === "json"
       ? JSON.stringify(payload, null, 2)
-      : `# CodeCross V1 Report\n\nRisk Level: high\n\n${sampleFindings
+      : `# CodeCross 最终审查报告\n\nRisk Level: high\n\n${sampleFindings
           .map((finding) => `- ${finding.severity.toUpperCase()} ${finding.id}: ${finding.problem}`)
           .join("\n")}\n`;
   const blob = new Blob([content], { type: format === "json" ? "application/json" : "text/markdown" });

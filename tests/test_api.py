@@ -165,7 +165,7 @@ def test_create_poll_events_and_export_demo_run():
 
     assert final_payload["status"] == "succeeded", final_payload.get("error")
     assert final_payload["snapshot"]["evaluator_report"]["risk_level"] == "high"
-    assert "CodeCross V1 Report" in final_payload["final_report"]
+    assert "CodeCross 最终审查报告" in final_payload["final_report"]
     event_types = [event["type"] for event in final_payload["events"]]
     assert "created" in event_types
     assert "running" in event_types
@@ -183,7 +183,7 @@ def test_create_poll_events_and_export_demo_run():
 
     markdown_response = client.get(f"/api/runs/{run_id}/export?format=markdown")
     assert markdown_response.status_code == 200
-    assert "CodeCross V1 Report" in markdown_response.text
+    assert "CodeCross 最终审查报告" in markdown_response.text
 
     json_response = client.get(f"/api/runs/{run_id}/export?format=json")
     assert json_response.status_code == 200

@@ -19,7 +19,6 @@ from .agents import (
     evaluator_agent,
     high_risk_review_agent,
     planner_agent,
-    report_formatter_agent,
     render_final_report,
     reviewer_agent,
     targeted_reviewer_agent,
@@ -49,7 +48,6 @@ from .schemas import (
     Finding,
     FindingVerification,
     HighRiskReviewReport,
-    ReportPresentation,
     ReviewPlan,
     ReviewerResult,
     TargetedReview,
@@ -105,7 +103,6 @@ class CodeCrossState(TypedDict, total=False):
     stop_reason: str
     evaluator_report: EvaluatorReport
     high_risk_review: HighRiskReviewReport | None
-    report_presentation: ReportPresentation
     final_report: str
 
 
@@ -419,11 +416,11 @@ def evaluator_node(state: CodeCrossState) -> dict[str, EvaluatorReport]:
 
 
 def route_after_evaluator(state: CodeCrossState) -> str:
-    """条件边：高风险时触发二次复核，否则进入报告格式化。"""
+    """条件边：高风险时触发二次复核，否则进入最终报告。"""
 
     if state["evaluator_report"].needs_high_risk_review:
         return "high_risk_review"
-    return "report_formatter"
+    return "final_report"
 
 
 def high_risk_review_node(state: CodeCrossState) -> dict[str, HighRiskReviewReport | None]:
@@ -434,23 +431,6 @@ def high_risk_review_node(state: CodeCrossState) -> dict[str, HighRiskReviewRepo
             evaluator_report=state["evaluator_report"],
             findings=state.get("findings", []),
             board_summary=state["board_summary"],
-            config=state["config"],
-        )
-    }
-
-
-def report_formatter_node(state: CodeCrossState) -> dict[str, ReportPresentation]:
-    """Graph 节点：翻译、去重并统一最终报告展示格式。"""
-
-    return {
-        "report_presentation": report_formatter_agent(
-            review_plan=state["review_plan"],
-            code_context=state.get("code_context"),
-            reviewer_results=state.get("reviewer_results", []),
-            findings=state.get("findings", []),
-            board_summary=state["board_summary"],
-            evaluator_report=state["evaluator_report"],
-            high_risk_review=state.get("high_risk_review"),
             config=state["config"],
         )
     }
@@ -467,7 +447,6 @@ def final_report_node(state: CodeCrossState) -> dict[str, str]:
             board_summary=state["board_summary"],
             evaluator_report=state["evaluator_report"],
             high_risk_review=state.get("high_risk_review"),
-            report_presentation=state.get("report_presentation"),
         )
     }
 
@@ -498,7 +477,6 @@ def build_graph(config: ProjectConfig):
     graph.add_node("update_board", update_board_node)
     graph.add_node("evaluator", evaluator_node)
     graph.add_node("high_risk_review", high_risk_review_node)
-    graph.add_node("report_formatter", report_formatter_node)
     graph.add_node("final_report", final_report_node)
 
     # 主干流程：Planner -> Context Retriever -> 多 reviewer 并行 -> Board -> Evidence Loop -> Evaluator。
@@ -539,10 +517,9 @@ def build_graph(config: ProjectConfig):
     graph.add_conditional_edges(
         "evaluator",
         route_after_evaluator,
-        {"high_risk_review": "high_risk_review", "report_formatter": "report_formatter"},
+        {"high_risk_review": "high_risk_review", "final_report": "final_report"},
     )
-    graph.add_edge("high_risk_review", "report_formatter")
-    graph.add_edge("report_formatter", "final_report")
+    graph.add_edge("high_risk_review", "final_report")
     graph.add_edge("final_report", END)
     return graph.compile()
 
@@ -557,7 +534,6 @@ def _infer_progress_node(state: CodeCrossState) -> str:
 
     checkpoints = [
         ("final_report", "final_report"),
-        ("report_presentation", "report_formatter"),
         ("high_risk_review", "high_risk_review"),
         ("evaluator_report", "evaluator"),
         ("board_summary", "update_board"),

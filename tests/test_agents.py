@@ -12,6 +12,7 @@ from codecross.schemas import (
     FindingVerification,
     LineRange,
     ReviewPlan,
+    ReviewerResult,
     TestCase,
     TestIntent,
 )
@@ -174,8 +175,8 @@ def test_mock_test_author_adds_normal_path_control_case():
     assert "test_safe_divide_normal_division_returns_quotient" in names
 
 
-def test_report_formatter_localizes_and_deduplicates_findings():
-    """Final presentation agent should polish raw reviewer output without changing facts."""
+def test_final_report_localizes_and_deduplicates_findings():
+    """Final report should polish raw reviewer output without a separate model node."""
 
     first = Finding(
         finding_id="finding_path_1",
@@ -211,11 +212,21 @@ def test_report_formatter_localizes_and_deduplicates_findings():
         },
     )
 
-    presentation = agents.report_formatter_agent(
+    report = agents.render_final_report(
         review_plan=ReviewPlan(changed_files=["src/utils/readUpload.js"]),
         code_context=None,
-        reviewer_results=[],
-        findings=[first, duplicate],
+        reviewer_results=[
+            ReviewerResult(
+                reviewer_name="logic_reviewer",
+                model="deepseek/mock",
+                findings=[first],
+            ),
+            ReviewerResult(
+                reviewer_name="security_maintainability_reviewer",
+                model="anthropic/mock",
+                findings=[duplicate],
+            ),
+        ],
         board_summary=board,
         evaluator_report=EvaluatorReport(
             risk_level="critical",
@@ -224,13 +235,12 @@ def test_report_formatter_localizes_and_deduplicates_findings():
             reasoning="A critical finding has supporting evidence.",
         ),
         high_risk_review=None,
-        config=load_project_config(mock_llm=True),
     )
 
-    assert "严重风险" in presentation.conclusion_summary
-    assert presentation.recommended_action == "暂缓合并，先修复高风险问题"
-    assert len(presentation.finding_rows) == 1
-    row = presentation.finding_rows[0]
-    assert row.finding_ids == ["finding_path_1", "finding_path_2"]
-    assert "路径穿越风险" in row.problem
-    assert "path.resolve" in row.suggestion
+    assert "CodeCross 最终审查报告" in report
+    assert "严重风险" in report
+    assert "暂缓合并，先修复高风险问题" in report
+    assert "路径穿越风险" in report
+    assert "已合并" in report
+    assert "path.resolve" in report
+    assert "Path traversal vulnerability" not in report

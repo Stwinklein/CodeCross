@@ -33,7 +33,7 @@ from .reporting import (
     test_summary,
     verification_counts,
 )
-from .schemas import Finding, ReportFindingRow, ReportPresentation, ReviewerResult
+from .schemas import Finding, ReportFindingRow, ReviewerResult
 from .workflow import CodeCrossState, run_workflow
 
 
@@ -134,7 +134,7 @@ def _model_label_from_state(state: CodeCrossState) -> str:
 
 
 def _render_report_findings_table(rows_to_render: list[ReportFindingRow], limit: int) -> str:
-    """Render formatter-agent finding rows into a compact Markdown table."""
+    """Render final-report finding rows into a compact Markdown table."""
 
     rows_to_render = [
         row
@@ -222,16 +222,11 @@ def build_pr_comment(
     board = state.get("board_summary")
     evaluator = state.get("evaluator_report")
     findings: list[Finding] = state.get("findings", [])
-    raw_presentation = state.get("report_presentation")
-    presentation = (
-        ReportPresentation.model_validate(raw_presentation)
-        if raw_presentation
-        else build_default_report_presentation(
-            findings=findings,
-            board_summary=board,
-            evaluator_report=evaluator,
-            high_risk_review=state.get("high_risk_review"),
-        )
+    presentation = build_default_report_presentation(
+        findings=findings,
+        board_summary=board,
+        evaluator_report=evaluator,
+        high_risk_review=state.get("high_risk_review"),
     )
 
     risk_level = evaluator.risk_level if evaluator else "unknown"
@@ -321,7 +316,6 @@ def _required_settings_for_ci(config: ProjectConfig) -> list[ModelSettings]:
         "test_result_analyzer",
         "coverage_gap_agent",
         "evaluator",
-        "report_formatter",
     }
     settings = [
         setting

@@ -18,7 +18,6 @@ from .schemas import (
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _ASCII_WORD_RE = re.compile(r"[A-Za-z]{3,}")
-_PLACEHOLDER_RE = re.compile(r"未能稳定中文化|请结合完整产物中的原始记录复核")
 
 
 RISK_LABELS = {
@@ -230,8 +229,6 @@ def verification_counts(board: Any) -> str:
         f"{verification_text(status)} {count}"
         for status, count in sorted(counts.items())
     )
-
-
 def test_summary(board: Any) -> str:
     """Return a compact Chinese test execution summary."""
 
@@ -262,12 +259,6 @@ def severity_sort_key(finding: Finding) -> tuple[int, str]:
 
     severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     return (severity_order.get(finding.severity, 9), finding.file_path)
-
-
-def has_formatter_placeholder(text: str) -> bool:
-    """Detect generic formatter fallback prose that should not reach PR comments."""
-
-    return bool(_PLACEHOLDER_RE.search(text or ""))
 
 
 def _manual_review_problem(finding: Finding) -> str:
@@ -422,43 +413,5 @@ def build_default_report_presentation(
         conclusion_summary="\n".join(conclusion_lines),
         recommended_action=recommended_action,
         finding_rows=rows,
-        formatter_notes="已完成中文化、去重和 PR 评论格式化。",
+        presentation_notes="已完成中文化、去重和 PR 评论格式化。",
     )
-
-
-def normalize_report_presentation(
-    presentation: ReportPresentation,
-    fallback: ReportPresentation,
-) -> ReportPresentation:
-    """Keep model-formatted reports structured and Chinese-readable."""
-
-    if needs_chinese_fallback(presentation.conclusion_summary):
-        presentation.conclusion_summary = fallback.conclusion_summary
-    else:
-        presentation.conclusion_summary = polish_report_terms(presentation.conclusion_summary)
-    if needs_chinese_fallback(presentation.recommended_action):
-        presentation.recommended_action = fallback.recommended_action
-    else:
-        presentation.recommended_action = polish_report_terms(presentation.recommended_action)
-    if not presentation.finding_rows and fallback.finding_rows:
-        presentation.finding_rows = fallback.finding_rows
-    for index, row in enumerate(presentation.finding_rows):
-        fallback_row = fallback.finding_rows[index] if index < len(fallback.finding_rows) else None
-        if fallback_row:
-            if not row.finding_ids:
-                row.finding_ids = fallback_row.finding_ids
-            if not row.location:
-                row.location = fallback_row.location
-            if not row.verification_status:
-                row.verification_status = fallback_row.verification_status
-            if needs_chinese_fallback(row.problem) or has_formatter_placeholder(row.problem):
-                row.problem = fallback_row.problem
-            else:
-                row.problem = polish_report_terms(row.problem)
-            if needs_chinese_fallback(row.suggestion) or has_formatter_placeholder(row.suggestion):
-                row.suggestion = fallback_row.suggestion
-            else:
-                row.suggestion = polish_report_terms(row.suggestion)
-        if not row.source_reviewers and fallback_row:
-            row.source_reviewers = fallback_row.source_reviewers
-    return presentation

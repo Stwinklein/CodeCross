@@ -23,8 +23,6 @@ from codecross.schemas import (
     Finding,
     FindingVerification,
     LineRange,
-    ReportFindingRow,
-    ReportPresentation,
     ReviewPlan,
     ReviewerResult,
 )
@@ -119,33 +117,6 @@ def test_build_pr_comment_contains_marker_summary_and_findings():
     assert "API Key 和 Base URL" in comment
 
 
-def test_build_pr_comment_uses_formatter_presentation():
-    """CI comment should render the final formatter output instead of raw reviewer prose."""
-
-    state = _sample_state()
-    state["report_presentation"] = ReportPresentation(
-        conclusion_summary="本次 PR 由报告格式化节点整理为中文结论。",
-        recommended_action="先修复格式化节点列出的阻断问题。",
-        finding_rows=[
-            ReportFindingRow(
-                finding_ids=["finding_a", "finding_b"],
-                severity="high",
-                verification_status="已被证据支持",
-                location="src/app.py:12",
-                problem="格式化后的中文问题",
-                suggestion="格式化后的中文建议",
-            )
-        ],
-    )
-
-    comment = build_pr_comment(state)
-
-    assert "### 结论摘要" in comment
-    assert "本次 PR 由报告格式化节点整理为中文结论。" in comment
-    assert "格式化后的中文问题（已合并 2 条相近发现）" in comment
-    assert "The new branch can return None" not in comment
-
-
 def test_build_pr_comment_handles_empty_state():
     """CI 异常路径也应能渲染一条可读报告，而不是因为缺字段二次崩溃。"""
 
@@ -157,37 +128,35 @@ def test_build_pr_comment_handles_empty_state():
     assert "当前没有剩余已被证据支持或待人工确认的重点问题" in comment
 
 
-def test_build_pr_comment_hides_refuted_formatter_rows():
+def test_build_pr_comment_hides_refuted_findings():
     """重点问题表应降噪已被测试反驳的 finding。"""
 
     state = _sample_state()
-    state["report_presentation"] = ReportPresentation(
-        conclusion_summary="本次 PR 还有一个可确认问题。",
-        recommended_action="人工确认后合并。",
-        finding_rows=[
-            ReportFindingRow(
-                finding_ids=["refuted"],
-                severity="high",
-                verification_status="已被测试反驳",
-                location="src/app.py:1",
-                problem="已反驳的问题",
-                suggestion="无需修复。",
-            ),
-            ReportFindingRow(
-                finding_ids=["supported"],
-                severity="medium",
-                verification_status="已被证据支持",
-                location="src/app.py:2",
-                problem="仍需处理的问题",
-                suggestion="补一条保护逻辑。",
-            ),
-        ],
+    refuted = Finding(
+        finding_id="finding_refuted",
+        source_reviewer="logic_reviewer",
+        model="deepseek/deepseek-chat",
+        category="runtime",
+        severity="high",
+        file_path="src/app.py",
+        line_range=LineRange(start=1, end=1),
+        problem="Refuted shell command warning.",
+        evidence="Generated test disproved it.",
+        impact="No impact.",
+        suggestion="No change needed.",
+    )
+    state["findings"].append(refuted)
+    state["reviewer_results"][0].findings.append(refuted)
+    state["board_summary"].finding_count = 2
+    state["board_summary"].finding_verifications[refuted.finding_id] = FindingVerification(
+        finding_id=refuted.finding_id,
+        status="refuted",
     )
 
     comment = build_pr_comment(state)
 
-    assert "仍需处理的问题" in comment
-    assert "已反驳的问题" not in comment
+    assert "`src/app.py:12`" in comment
+    assert "Refuted shell command warning" not in comment
 
 
 def test_default_presentation_keeps_unknown_findings_actionable_without_placeholder():
