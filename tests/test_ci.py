@@ -20,6 +20,7 @@ from codecross.schemas import (
     CodeContextSnippet,
     EvaluatorReport,
     Finding,
+    FindingVerification,
     LineRange,
     ReviewPlan,
     ReviewerResult,
@@ -76,6 +77,13 @@ def _sample_state() -> dict:
             passed_count=0,
             failed_count=0,
             error_count=0,
+            finding_verifications={
+                finding.finding_id: FindingVerification(
+                    finding_id=finding.finding_id,
+                    status="supported",
+                    reason="Reproduced by generated test.",
+                )
+            },
         ),
         "evaluator_report": EvaluatorReport(
             risk_level="high",
@@ -99,11 +107,132 @@ def test_build_pr_comment_contains_marker_summary_and_findings():
     )
 
     assert COMMENT_MARKER in comment
-    assert "CodeCross PR Review" in comment
-    assert "Risk: **high**" in comment
+    assert "CodeCross PR 审查报告" in comment
+    assert "风险等级 | **高风险 (`high`)**" in comment
+    assert "验证状态 | 已被证据支持 1" in comment
     assert "`src/app.py:12`" in comment
     assert "abcdef123456" in comment
     assert "deepseek/deepseek-chat" in comment
+    assert "API Key 和 Base URL" in comment
+
+
+def test_build_pr_comment_renders_complex_chinese_dashboard():
+    """复杂 PR 摘要应把多 reviewer、多状态和测试结果都直观展示出来。"""
+
+    high_finding = Finding(
+        source_reviewer="logic_reviewer",
+        model="deepseek/deepseek-chat",
+        category="data_consistency",
+        severity="high",
+        confidence="high",
+        file_path="webapi/services/order_service.py",
+        line_range=LineRange(start=88, end=110),
+        problem="库存扣减和订单创建之间没有事务边界，异常时可能出现库存已扣但订单未创建。",
+        evidence="create_order 先调用 decrement_stock，再调用 repository.save_order。",
+        impact="用户会看到下单失败，但库存已经减少，后续对账会出现不一致。",
+        suggestion="把库存扣减和订单写入放进同一个事务，或使用补偿逻辑回滚库存。",
+    )
+    medium_finding = Finding(
+        source_reviewer="security_maintainability_reviewer",
+        model="anthropic/claude-opus-4-6",
+        category="auth",
+        severity="medium",
+        confidence="medium",
+        file_path="webapi/controllers/admin.py",
+        line_range=LineRange(start=42, end=42),
+        problem="新增管理接口只校验登录态，没有校验管理员角色。",
+        evidence="route handler 只调用 require_user。",
+        impact="普通登录用户可能访问管理入口。",
+        suggestion="在 handler 前增加 require_admin 或等价权限检查。",
+    )
+
+    state = _sample_state()
+    state["review_plan"] = ReviewPlan(
+        changed_files=[
+            "webapi/services/order_service.py",
+            "webapi/controllers/admin.py",
+            "webapi/repositories/order_repository.py",
+        ],
+        changed_symbols=["create_order", "decrement_stock", "admin_rebuild_index"],
+    )
+    state["code_context"] = CodeContext(
+        changed_files=["webapi/services/order_service.py", "webapi/controllers/admin.py"],
+        changed_symbols=["create_order", "admin_rebuild_index"],
+        snippets=[
+            CodeContextSnippet(
+                kind="changed_file",
+                file_path="webapi/services/order_service.py",
+                reason="changed file",
+                content="...",
+            ),
+            CodeContextSnippet(
+                kind="call_site",
+                file_path="webapi/controllers/order.py",
+                reason="caller",
+                content="...",
+            ),
+            CodeContextSnippet(
+                kind="existing_test",
+                file_path="tests/test_orders.py",
+                reason="existing coverage",
+                content="...",
+            ),
+        ],
+    )
+    state["reviewer_results"] = [
+        ReviewerResult(
+            reviewer_name="logic_reviewer",
+            model="deepseek/deepseek-chat",
+            findings=[high_finding],
+        ),
+        ReviewerResult(
+            reviewer_name="security_maintainability_reviewer",
+            model="anthropic/claude-opus-4-6",
+            findings=[medium_finding],
+        ),
+    ]
+    state["findings"] = [medium_finding, high_finding]
+    state["board_summary"] = BoardSummary(
+        reviewer_count=2,
+        finding_count=2,
+        test_intent_count=2,
+        test_case_count=3,
+        test_round_count=2,
+        passed_count=1,
+        failed_count=1,
+        error_count=1,
+        skipped_count=1,
+        stop_reason="max_verification_rounds_reached",
+        finding_verifications={
+            high_finding.finding_id: FindingVerification(
+                finding_id=high_finding.finding_id,
+                status="supported",
+                reason="A generated regression test reproduced the issue.",
+            ),
+            medium_finding.finding_id: FindingVerification(
+                finding_id=medium_finding.finding_id,
+                status="inconclusive",
+                reason="The generated permission test needs a real auth fixture.",
+            ),
+        },
+    )
+    state["evaluator_report"] = EvaluatorReport(
+        risk_level="high",
+        confidence="high",
+        recommended_action="Block the merge until the order transaction bug is fixed.",
+    )
+
+    comment = build_pr_comment(state)
+
+    assert "暂缓合并，先修复高风险问题" in comment
+    assert "通过 1，失败 1，错误/阻塞 1，跳过 1" in comment
+    assert "达到最大验证轮次 (`max_verification_rounds_reached`)" in comment
+    assert "变更文件 1" in comment
+    assert "调用点 1" in comment
+    assert "现有测试 1" in comment
+    assert "已被证据支持" in comment
+    assert "证据不足" in comment
+    assert comment.index("库存扣减") < comment.index("新增管理接口")
 
 
 def test_truncate_comment_keeps_marker():
@@ -112,7 +241,7 @@ def test_truncate_comment_keeps_marker():
     comment = truncate_comment(COMMENT_MARKER + "\n" + ("x" * 500), 120)
 
     assert COMMENT_MARKER in comment
-    assert "Comment truncated" in comment
+    assert "评论内容已截断" in comment
 
 
 def test_validate_model_credentials_reports_missing_env(monkeypatch):

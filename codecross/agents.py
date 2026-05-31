@@ -997,9 +997,9 @@ def evaluator_agent(
         coverage_gaps=board_summary.coverage_gaps,
         verification_summary=render_board_markdown(board_summary),
         recommended_action=(
-            "Block or request changes before merge."
+            "阻断合并，或要求修复后再合并。"
             if risk_level in {"high", "critical"}
-            else "Review unresolved notes, then proceed according to project policy."
+            else "先人工确认未解决事项，再按项目策略决定是否合并。"
         ),
         needs_high_risk_review=risk_level in {"high", "critical"},
         reasoning=reasoning,
@@ -1022,8 +1022,8 @@ def high_risk_review_agent(
     blocking = evaluator_report.top_findings
     if config.mock_llm:
         return HighRiskReviewReport(
-            analysis="High risk review confirms the supported findings should block the change.",
-            recommended_action="Fix the blocking findings and rerun CodeCross.",
+            analysis="高风险二次确认认为：已有证据支持的 finding 应阻断本次变更。",
+            recommended_action="先修复阻断级 finding，然后重新运行 CodeCross。",
             blocking_findings=blocking,
         )
 
@@ -1047,7 +1047,7 @@ def high_risk_review_agent(
         )  # type: ignore[return-value]
     except ModelCallError:
         return HighRiskReviewReport(
-            analysis="High risk reviewer failed; use the rule-first evaluator result.",
+            analysis="高风险 reviewer 调用失败；沿用规则优先的 Evaluator 结果。",
             recommended_action=evaluator_report.recommended_action,
             blocking_findings=blocking,
         )
@@ -1064,28 +1064,32 @@ def render_final_report(
 ) -> str:
     """把 workflow 的关键结果汇总成 Markdown 报告。"""
 
+    # 最终报告比 PR 评论更完整，但仍然只放摘要：每个 reviewer 的完整 finding、
+    # test_intent 和错误对象已经在结构化 state 中，前端或 JSON artifact 可以展开。
     reviewer_sections: list[str] = []
     for result in reviewer_results:
         reviewer_sections.append(
             "\n".join(
                 [
                     f"### {result.reviewer_name}",
-                    f"- Model: {result.model}",
-                    f"- Findings: {len(result.findings)}",
-                    f"- Test intents: {len(result.test_intents)}",
-                    f"- Errors: {len(result.errors)}",
-                    result.reviewer_notes,
+                    f"- 模型：{result.model}",
+                    f"- Findings：{len(result.findings)}",
+                    f"- 测试意图：{len(result.test_intents)}",
+                    f"- 错误数：{len(result.errors)}",
+                    result.reviewer_notes or "无额外备注。",
                 ]
             )
         )
 
+    # 高风险二次确认是可选节点：只有 evaluator 认为 high/critical 时才会出现。
+    # 因此这里先准备空字符串，避免低风险 PR 报告里出现空标题。
     high_risk_section = ""
     if high_risk_review:
         high_risk_section = (
-            "\n## High Risk Review\n\n"
+            "\n## 高风险二次确认\n\n"
             f"{high_risk_review.analysis}\n\n"
-            f"Recommended action: {high_risk_review.recommended_action}\n\n"
-            f"Blocking findings: {', '.join(high_risk_review.blocking_findings) or 'none'}\n"
+            f"建议动作：{high_risk_review.recommended_action}\n\n"
+            f"阻断级 findings：{', '.join(high_risk_review.blocking_findings) or '无'}\n"
         )
 
     context_section = ""
@@ -1093,32 +1097,32 @@ def render_final_report(
         # 报告里只放摘要，不展开所有代码片段，避免 Markdown 过长。
         # 真正完整的 snippets 仍保留在 JSON state 里，适合前端抽屉或调试工具展示。
         context_section = (
-            "\n## Code Context\n\n"
-            f"- Changed files: {', '.join(code_context.changed_files) or 'none'}\n"
-            f"- Changed symbols: {', '.join(code_context.changed_symbols) or 'none'}\n"
-            f"- Snippets: {len(code_context.snippets)}\n"
-            f"- Missing files: {', '.join(code_context.missing_files) or 'none'}\n\n"
+            "\n## 代码上下文\n\n"
+            f"- 变更文件：{', '.join(code_context.changed_files) or '无'}\n"
+            f"- 变更符号：{', '.join(code_context.changed_symbols) or '无'}\n"
+            f"- 上下文片段数：{len(code_context.snippets)}\n"
+            f"- 未能读取的文件：{', '.join(code_context.missing_files) or '无'}\n\n"
         )
 
     return (
-        "# CodeCross V1 Report\n\n"
-        f"## Risk\n\n"
-        f"- Level: {evaluator_report.risk_level}\n"
-        f"- Confidence: {evaluator_report.confidence}\n"
-        f"- Reasoning: {evaluator_report.reasoning}\n"
-        f"- Recommended action: {evaluator_report.recommended_action}\n\n"
-        "## Review Plan\n\n"
-        f"- Changed files: {', '.join(review_plan.changed_files) or 'none'}\n"
-        f"- Changed symbols: {', '.join(review_plan.changed_symbols) or 'none'}\n"
-        f"- Risk areas: {', '.join(review_plan.risk_areas) or 'none'}\n"
-        f"- Testing focus: {', '.join(review_plan.testing_focus) or 'none'}\n\n"
+        "# CodeCross V1 Report / 最终审查报告\n\n"
+        f"## 风险结论\n\n"
+        f"- 风险等级：{evaluator_report.risk_level}\n"
+        f"- 置信度：{evaluator_report.confidence}\n"
+        f"- 判断理由：{evaluator_report.reasoning}\n"
+        f"- 建议动作：{evaluator_report.recommended_action}\n\n"
+        "## 审查计划\n\n"
+        f"- 变更文件：{', '.join(review_plan.changed_files) or '无'}\n"
+        f"- 变更符号：{', '.join(review_plan.changed_symbols) or '无'}\n"
+        f"- 风险方向：{', '.join(review_plan.risk_areas) or '无'}\n"
+        f"- 测试重点：{', '.join(review_plan.testing_focus) or '无'}\n\n"
         + context_section
-        + "## Reviewers\n\n"
+        + "## Reviewer 输出\n\n"
         + "\n\n".join(reviewer_sections)
         + "\n\n"
         + render_board_markdown(board_summary)
-        + "\n## Evidence Summary\n\n"
+        + "\n## 证据摘要\n\n"
         f"{evaluator_report.evidence_summary}\n\n"
-        f"{evaluator_report.failed_tests_summary or 'No failed test details.'}\n"
+        f"{evaluator_report.failed_tests_summary or '没有失败测试详情。'}\n"
         + high_risk_section
     )

@@ -67,17 +67,21 @@ jobs:
         run: |
           {
             echo '<!-- codecross-pr-review -->'
-            echo '## CodeCross PR Review'
+            echo '## CodeCross PR 审查报告'
             echo ''
-            echo '- Mode: **failed before review completed**'
-            echo '- Commit: `${{ github.event.pull_request.head.sha }}`'
-            echo '- CI run: [open run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})'
+            echo '### 结论看板'
             echo ''
-            echo '**Recommended Action**'
+            echo '| 项目 | 结果 |'
+            echo '| --- | --- |'
+            echo '| 运行模式 | 审查完成前失败 |'
+            echo '| Commit | `${{ github.event.pull_request.head.sha }}` |'
+            echo '| CI 运行 | [打开 Actions 运行](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |'
             echo ''
-            echo 'CodeCross could not complete this PR review. Check the Actions log for missing model secrets, dependency installation failures, or runtime errors.'
+            echo '### 建议动作'
             echo ''
-            echo 'Common setup values: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`.'
+            echo 'CodeCross 没能完成本次 PR 审查。请查看 Actions 日志，重点检查模型密钥、依赖安装和运行时错误。'
+            echo ''
+            echo '常见配置项：`DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`。'
           } > codecross-comment.md
 
       - name: Post or update PR comment
