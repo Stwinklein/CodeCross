@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codecross"
+version = "1.6.0"
+description = "Multi-agent code review workflow with GitHub PR comment integration."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic",
+  "python-dotenv",
+  "typing-extensions",
+  "langchain",
+  "langchain-core",
+  "langchain-deepseek",
+  "langchain-anthropic",
+  "langgraph",
+  "fastapi",
+  "httpx",
+  "uvicorn",
+  "pytest",
+]
+
+[project.scripts]
+codecross = "codecross.main:main"
+codecross-ci = "codecross.ci:main"
+codecross-pr-comment = "scripts.github_pr_comment:main"
+
+[tool.setuptools.packages.find]
+include = ["codecross*", "a2aproject*", "scripts*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

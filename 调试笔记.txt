@@ -1,0 +1,57 @@
+planner
+->reviewers
+->init board
+->selection verification targets
+->test strategy
+->test_case
+->executor
+->test_result_analyzer
+->coverage_gap
+->targeted_review
+->update_board
+->evaluator
+->high_risk_riview
+->final_report
+主干流程：Planner -> 多 reviewer 并行 -> Board -> Evidence Loop -> Evaluator。
+graph部分
+#Board 选出了待验证目标？
+      # 是 -> 进入 Evidence Verification Loop，生成测试策略
+      # 否 -> 跳过测试验证，直接最终评估
+    graph.add_conditional_edges(
+        "select_verification_targets",
+        route_after_select,
+        {"test_strategy": "test_strategy", "evaluator": "evaluator"},
+    )
+核心testrunner loop
+通过这个路由控制是否继续执行test，当没有target再次生成是进入到evaluator
+
+graph.add_conditional_edges(
+    "coverage_gap",
+    route_after_coverage_gap,
+    {"targeted_review": "targeted_review", "update_board": "update_board"},
+)
+coverage_gap_node 执行完之后
+  -> 调用 route_after_coverage_gap(state)
+  -> 根据返回值决定下一步走 targeted_review 还是 update_board
+结果分析决定是否需要定向复审，也就是说targetedreview就是需要来帮忙解释
+
+
+select_verification_targets
+  -> test_strategy
+  -> test_case
+  -> executor
+  -> test_result_analyzer
+  -> coverage_gap
+  -> targeted_review?   可选
+  -> update_board
+  -> route_after_update_board
+      -> 如果还要继续，回到 select_verification_targets
+      -> 如果不用继续，进入 evaluator
+
+
+config文件是定义模型配置参数的例如maxtoken和model之类的
+
+
+
+
+
