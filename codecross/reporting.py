@@ -47,6 +47,12 @@ VERIFICATION_LABELS = {
     "unverified": "尚未验证",
     "inconclusive": "证据不足",
     "not_testable": "无法自动测试",
+    # Issue #2 fallback：LLM 交叉验证产出的状态。命名要和 pytest 路径区分开，
+    # 否则在 PR 评论里看不出某个 finding 是“真实测试支持”还是“模型推理支持”。
+    "cross_supported": "模型交叉验证支持",
+    "cross_refuted": "模型交叉验证反驳",
+    "cross_inconclusive": "模型交叉验证证据不足",
+    "needs_human_review": "需人工裁定",
 }
 
 CONTEXT_KIND_LABELS = {
@@ -422,7 +428,8 @@ def build_default_report_presentation(
     verifications = board_summary.finding_verifications if board_summary else {}
     for finding in sorted(findings, key=severity_sort_key):
         verification = verifications.get(finding.finding_id)
-        if verification and verification.status == "refuted":
+        if verification and verification.status in {"refuted", "cross_refuted"}:
+            # 不论 pytest 还是 LLM 交叉验证给出的反驳，都不进重点问题表格。
             continue
 
         problem, suggestion = localized_finding_text(finding)

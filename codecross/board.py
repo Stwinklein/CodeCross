@@ -36,6 +36,12 @@ VERIFICATION_STATUS_LABELS = {
     "unverified": "尚未验证",
     "inconclusive": "证据不足",
     "not_testable": "无法自动测试",
+    # Issue #2：模型交叉验证产生的 verification 状态。中文标签和 pytest 路径
+    # 区分开，让 PR 评论一眼能看出“这条结论由谁背书”。
+    "cross_supported": "模型交叉支持",
+    "cross_refuted": "模型交叉反驳",
+    "cross_inconclusive": "模型交叉证据不足",
+    "needs_human_review": "需人工裁定",
 }
 
 STOP_REASON_LABELS = {
@@ -230,6 +236,48 @@ def select_next_verification_targets(
 def _result_to_evidence(result: TestResult) -> EvidenceItem:
     """把 executor 的 TestResult 映射成 Board EvidenceItem。"""
 
+    # Issue #2：LLM 交叉验证结果走专门的 evidence_type，
+    # 这样 reporting / evaluator 可以用 evidence_type 直接区分两条证据线。
+    if result.evidence_kind == "llm_cross_verification":
+        payload = result.cross_payload
+        # status -> 证据强度。这里再经手一次，保持 Board 内部不依赖
+        # CrossVerificationPayload.suggested_strength（万一未来 ReproAgent
+        # 给的 hint 我们不想信任，可以在这里覆写规则）。
+        if result.status == "cross_confirmed":
+            strength = "medium"
+        elif result.status == "cross_refuted":
+            strength = "medium"
+        elif result.status == "cross_supported":
+            strength = "weak"
+        else:
+            strength = "weak"
+        summary = (
+            payload.reasoning
+            if payload and payload.reasoning
+            else f"Cross verification status: {result.status}"
+        )
+        raw_reference = ""
+        if payload:
+            ref_parts: list[str] = []
+            if payload.reproduction_steps:
+                ref_parts.append("steps:\n" + "\n".join(payload.reproduction_steps))
+            if payload.counter_examples:
+                ref_parts.append("counter_examples:\n" + "\n".join(payload.counter_examples))
+            if payload.expected_observation:
+                ref_parts.append(f"expected: {payload.expected_observation}")
+            raw_reference = "\n\n".join(ref_parts)[-2000:]
+        return EvidenceItem(
+            evidence_type="llm_cross_verification",
+            source=payload.model if payload else "llm_cross_verification",
+            related_finding_ids=result.related_finding_ids,
+            related_test_case_id=result.test_case_id,
+            related_test_result_id=result.test_result_id,
+            summary=summary,
+            raw_reference=raw_reference,
+            strength=strength,
+            created_round=result.round_index,
+        )
+
     if result.status == "failed" and result.is_reproducible:
         evidence_type = "test_failure"
         strength = "strong"
@@ -261,6 +309,66 @@ def _result_to_evidence(result: TestResult) -> EvidenceItem:
     )
 
 
+def _apply_cross_decision(
+    *,
+    verification: FindingVerification,
+    counts: dict[str, int],
+    previous_status: str,
+    round_index: int,
+) -> None:
+    """根据本 finding 上累计的 cross verification 计数更新 verification。
+
+    决策规则（保守优先，源自 Issue #2 设计稿）：
+    - confirmed 与 refuted 同时存在 -> needs_human_review。模型互相矛盾，
+      不能让 board 选边站，必须升级到人。
+    - 仅 refuted -> cross_refuted。
+    - 仅 confirmed -> cross_supported（只到 “supported”，不能直接到原 supported；
+      因为这条证据来自模型推理，不是真实 pytest 失败）。
+    - 仅 supported -> cross_inconclusive 升级到 cross_supported？不。
+      模型自己只敢说 supported（弱信心）的情况下，board 同样保守落到
+      cross_inconclusive，避免 evaluator 误把它当成结论。
+    - 其它（仅 inconclusive 或全空）-> cross_inconclusive。
+
+    pytest 已经给出 supported/refuted/not_testable 的 finding 不会被覆盖；
+    这层保护在调用点之前就该过滤，但这里再校一道更保险。
+    """
+
+    if previous_status in {"supported", "refuted", "not_testable"}:
+        return
+
+    confirmed = counts.get("confirmed", 0)
+    refuted = counts.get("refuted", 0)
+    supported = counts.get("supported", 0)
+
+    if confirmed and refuted:
+        verification.status = "needs_human_review"
+        verification.confidence = "low"
+        verification.reason = "Cross verification 出现冲突（同一 finding 同时被 confirmed 与 refuted）。"
+        verification.next_action = "请人工裁定后再决定该 finding 是否成立。"
+    elif refuted:
+        verification.status = "cross_refuted"
+        verification.confidence = "medium"
+        verification.reason = "Cross verification 给出反例，倾向于反驳该 finding。"
+        verification.next_action = "可关闭该 finding，但建议人工再核对反例细节。"
+    elif confirmed:
+        verification.status = "cross_supported"
+        verification.confidence = "medium"
+        verification.reason = "Cross verification 给出可复现步骤，倾向于支持该 finding。"
+        verification.next_action = "请人工执行复现步骤后再合入修复。"
+    elif supported:
+        verification.status = "cross_inconclusive"
+        verification.confidence = "low"
+        verification.reason = "Cross verification 仅给出弱支持，证据不足以下结论。"
+        verification.next_action = "建议补充上下文或人工复核。"
+    else:
+        verification.status = "cross_inconclusive"
+        verification.confidence = "low"
+        verification.reason = "Cross verification 未给出有效结论（abstain / inconclusive）。"
+        verification.next_action = "请人工复核或扩大代码上下文后重试。"
+
+    verification.last_updated_round = max(verification.last_updated_round, round_index)
+
+
 def update_finding_verifications_from_results(
     verifications: dict[str, FindingVerification],
     evidence_map: dict[str, EvidenceItem],
@@ -276,6 +384,31 @@ def update_finding_verifications_from_results(
     """
 
     status_changes: dict[str, str] = {}
+
+    # Issue #2：把 cross verification 结果按 finding 聚合一次。Board 状态机的
+    # 重要设计决策——cross 路径的状态汇总要 “集体决议”：同一 finding 上
+    # confirmed + refuted 同时出现要落到 needs_human_review，而不是按出现顺序
+    # 被最后一个 result 覆盖。
+    cross_by_finding: dict[str, dict[str, int]] = {}
+    cross_round_by_finding: dict[str, int] = {}
+    for result in test_results:
+        if result.evidence_kind != "llm_cross_verification":
+            continue
+        for finding_id in result.related_finding_ids:
+            counts = cross_by_finding.setdefault(
+                finding_id, {"confirmed": 0, "refuted": 0, "supported": 0, "inconclusive": 0}
+            )
+            if result.status == "cross_confirmed":
+                counts["confirmed"] += 1
+            elif result.status == "cross_refuted":
+                counts["refuted"] += 1
+            elif result.status == "cross_supported":
+                counts["supported"] += 1
+            else:
+                counts["inconclusive"] += 1
+            cross_round_by_finding[finding_id] = max(
+                cross_round_by_finding.get(finding_id, 0), result.round_index
+            )
 
     for result in test_results:
         if not result.related_finding_ids:
@@ -294,6 +427,22 @@ def update_finding_verifications_from_results(
             verification.last_updated_round = result.round_index
 
             previous = verification.status
+
+            if result.evidence_kind == "llm_cross_verification":
+                # cross 路径的状态决议在循环外做的聚合上读取，循环这里只负责
+                # 把单个 finding 的 cross 决议落地一次（多次落地结果一致，
+                # 因为聚合表是同一份）。
+                counts = cross_by_finding.get(finding_id, {})
+                _apply_cross_decision(
+                    verification=verification,
+                    counts=counts,
+                    previous_status=previous,
+                    round_index=cross_round_by_finding.get(finding_id, result.round_index),
+                )
+                if previous != verification.status:
+                    status_changes[finding_id] = f"{previous} -> {verification.status}"
+                continue
+
             if result.status == "failed" and result.is_reproducible:
                 verification.status = "supported"
                 verification.confidence = "high"

@@ -596,7 +596,7 @@ def test_case_agent(
     if not targets:
         return TestCaseBatch()
     if config.mock_llm:
-        return _mock_test_cases(round_index, targets, test_intents)
+        return _normalize_test_batch(_mock_test_cases(round_index, targets, test_intents), round_index)
 
     settings = config.model_config["test_case_agent"]
     try:
@@ -627,7 +627,9 @@ def test_case_agent(
     except ModelCallError:
         # 生成测试失败时可以回退到 mock/minimal 用例；其它异常保留堆栈，
         # 因为测试生成器是证据链核心，吞掉代码 bug 会让后续 Board 判断失真。
-        return _mock_test_cases(round_index, targets, test_intents)
+        return _normalize_test_batch(
+            _mock_test_cases(round_index, targets, test_intents), round_index
+        )
 
 
 def test_author_agent(
@@ -648,7 +650,10 @@ def test_author_agent(
     if not draft_test_cases:
         return TestCaseBatch()
     if config.mock_llm:
-        return _mock_test_author_cases(round_index, targets, test_intents, draft_test_cases)
+        return _normalize_test_batch(
+            _mock_test_author_cases(round_index, targets, test_intents, draft_test_cases),
+            round_index,
+        )
 
     settings = config.model_config.get("test_author_agent") or config.model_config["test_case_agent"]
     try:
@@ -677,7 +682,10 @@ def test_author_agent(
         )
         return _normalize_test_batch(batch, round_index)  # type: ignore[arg-type]
     except ModelCallError:
-        return _mock_test_author_cases(round_index, targets, test_intents, draft_test_cases)
+        return _normalize_test_batch(
+            _mock_test_author_cases(round_index, targets, test_intents, draft_test_cases),
+            round_index,
+        )
 
 
 def _normalize_test_batch(batch: TestCaseBatch, round_index: int) -> TestCaseBatch:
@@ -687,7 +695,71 @@ def _normalize_test_batch(batch: TestCaseBatch, round_index: int) -> TestCaseBat
         test_case.round_index = round_index
         if test_case.timeout_seconds <= 0:
             test_case.timeout_seconds = 15
+        # Issue #2 fallback：模型经常忘记填 target_language，导致下游
+        # detect_cross_verification_trigger 永远命不中 unsupported_language。
+        # 这里按 target_file 后缀确定性补齐，让 trigger 不依赖模型自觉。
+        if not test_case.target_language:
+            test_case.target_language = _infer_target_language(test_case.target_file)
     return batch
+
+
+# 把“文件后缀 -> 语言”集中在一张表里，trigger 与 author 共用同一份认知。
+# 表 key 是不带点的小写后缀；value 是 triggers.py 里使用的语言名称（小写）。
+# 想加 go/rust 时只要在这里加一行；executor / trigger 不用改。
+_LANGUAGE_BY_SUFFIX: dict[str, str] = {
+    "py": "python",
+    "pyi": "python",
+    "js": "javascript",
+    "mjs": "javascript",
+    "cjs": "javascript",
+    "jsx": "javascript",
+    "ts": "typescript",
+    "tsx": "typescript",
+    "vue": "vue",
+    "go": "go",
+    "rs": "rust",
+    "java": "java",
+    "kt": "kotlin",
+    "rb": "ruby",
+    "php": "php",
+    "cs": "csharp",
+    "swift": "swift",
+    "scala": "scala",
+    "c": "c",
+    "h": "c",
+    "cc": "cpp",
+    "cpp": "cpp",
+    "cxx": "cpp",
+    "hpp": "cpp",
+    "m": "objc",
+    "mm": "objcpp",
+    "sh": "shell",
+    "bash": "shell",
+    "zsh": "shell",
+    "ps1": "powershell",
+    "yml": "yaml",
+    "yaml": "yaml",
+    "json": "json",
+    "toml": "toml",
+    "html": "html",
+    "css": "css",
+    "scss": "scss",
+}
+
+
+def _infer_target_language(target_file: str | None) -> str | None:
+    """根据 target_file 后缀推断 target_language。
+
+    覆盖不到的情况返回 None：宁可让 trigger 走 pytest 默认分支，也不要乱填一个
+    伪语言把 fallback 误触发。比如 target_file 是空、是目录、或者后缀完全陌生。
+    """
+
+    if not target_file:
+        return None
+    suffix = target_file.rsplit(".", 1)
+    if len(suffix) != 2 or not suffix[1]:
+        return None
+    return _LANGUAGE_BY_SUFFIX.get(suffix[1].lower())
 
 
 def _mock_test_cases(
@@ -1019,10 +1091,19 @@ def evaluator_agent(
         for finding_id, verification in verifications.items()
         if verification.status == "supported" and finding_id in finding_map
     ]
+    # Issue #2：cross_supported / needs_human_review 是 LLM 交叉验证产出的状态，
+    # 证据强度比真实 pytest 失败弱。这里单独列出来，避免 evaluator 直接当成
+    # pytest-supported 给出 high/critical，但同时不能像 unverified 一样视而不见。
+    cross_supported = [
+        finding_map[finding_id]
+        for finding_id, verification in verifications.items()
+        if verification.status == "cross_supported" and finding_id in finding_map
+    ]
     unresolved_high = [
         finding_map[finding_id]
         for finding_id, verification in verifications.items()
-        if verification.status in {"unverified", "inconclusive"}
+        if verification.status
+        in {"unverified", "inconclusive", "cross_inconclusive", "needs_human_review"}
         and finding_id in finding_map
         and finding_map[finding_id].severity in {"high", "critical"}
     ]
@@ -1044,9 +1125,16 @@ def evaluator_agent(
     elif unresolved_high:
         risk_level = "medium"
         reasoning = "仍有高风险 finding 处于证据不足状态。"
+    elif any(finding.severity in {"high", "critical"} for finding in cross_supported):
+        # Issue #2：cross 路径只能给到 medium，因为模型推理证据不能等同于真实测试。
+        risk_level = "medium"
+        reasoning = "高风险 finding 仅由模型交叉验证支持，建议人工再核。"
     elif any(finding.severity == "medium" for finding in supported):
         risk_level = "medium"
         reasoning = "中风险 finding 已被证据支持。"
+    elif any(finding.severity == "medium" for finding in cross_supported):
+        risk_level = "medium"
+        reasoning = "中风险 finding 由模型交叉验证支持。"
     elif board_summary.error_count:
         risk_level = "medium"
         reasoning = "验证执行器报告了错误或被阻断的测试。"
@@ -1064,7 +1152,11 @@ def evaluator_agent(
 
     top_findings = [
         finding.finding_id
-        for finding in sorted(supported + unresolved_high, key=lambda item: item.severity, reverse=True)
+        for finding in sorted(
+            supported + cross_supported + unresolved_high,
+            key=lambda item: item.severity,
+            reverse=True,
+        )
     ][:5]
     needs_high_risk_review = risk_level in {"high", "critical"} and not self_reference
     if self_reference:

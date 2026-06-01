@@ -26,6 +26,14 @@ VerificationStatus = Literal[
     "refuted",
     "inconclusive",
     "not_testable",
+    # Issue #2 第二步：当 pytest 不可用、改走 LLM 交叉验证 Fallback 时，
+    # Board 用下面这组状态把“模型交叉验证”的结果与 pytest 证据区分开。
+    # 这里特意不复用 supported/refuted：因为它们的证据强度不一样，
+    # 报告层和后续 evaluator 规则需要能识别“这条结论来自模型交叉而非真实测试”。
+    "cross_supported",
+    "cross_refuted",
+    "cross_inconclusive",
+    "needs_human_review",
 ]
 EvidenceType = Literal[
     "test_failure",
@@ -35,10 +43,43 @@ EvidenceType = Literal[
     "targeted_review_note",
     "coverage_gap",
     "manual_note",
+    # Issue #2：LLM 交叉验证产出的证据。沿用一个独立的 evidence_type 是为了
+    # 报告/审计可以一眼看出“这条证据强度=模型推理而不是 pytest 跑出来”。
+    "llm_cross_verification",
 ]
 EvidenceStrength = Literal["weak", "medium", "strong"]
-TestType = Literal["pytest", "function_call", "property_based", "static_check", "manual"]
-TestStatus = Literal["passed", "failed", "error", "skipped", "timeout", "duplicate", "unsafe"]
+TestType = Literal[
+    "pytest",
+    "function_call",
+    "property_based",
+    "static_check",
+    "manual",
+    # Issue #2：当 pytest 不可用，executor 会派发到 cross_verification 分支。
+    # 用一个独立的 test_type 而不是 reusing "manual"，是因为这条路径有自己的
+    # budget、超时、模型调用预算和 Board 状态机，混在一起会让排查异常很痛。
+    "llm_cross_verification",
+]
+TestStatus = Literal[
+    "passed",
+    "failed",
+    "error",
+    "skipped",
+    "timeout",
+    "duplicate",
+    "unsafe",
+    # Issue #2 第二步：LLM 交叉验证 ReproAgent / RefuteAgent 的四种结论。
+    # 之所以单独一组 cross_*：让 executor 输出能直接驱动 Board 状态机，
+    # 不会被旧的 passed/failed 解析逻辑误读成“pytest 真的过了”。
+    "cross_confirmed",   # ReproAgent 给出可复现步骤且模型确认 finding 成立
+    "cross_supported",   # 模型偏向支持，但证据弱/复现步骤需人工确认
+    "cross_refuted",     # 模型给出反例 / 证伪了原 finding
+    "cross_inconclusive",  # 模型 abstain、超预算或冲突
+]
+EvidenceKind = Literal[
+    "pytest",
+    "static",
+    "llm_cross_verification",
+]
 CodeContextKind = Literal[
     "changed_file",
     "changed_hunk",
@@ -214,6 +255,38 @@ class TestCase(CodeCrossModel):
     timeout_seconds: int = 15
     requires_external_service: bool = False
     safety_level: Literal["safe", "review_required", "unsafe"] = "safe"
+    # Issue #2：当 executor 决定改走 LLM 交叉验证时，记录触发原因（unsupported_language /
+    # environment_error / executor_blocked）。报告层据此给用户解释“为什么这条没跑 pytest”。
+    cross_verification_trigger: (
+        Literal["unsupported_language", "environment_error", "executor_blocked"] | None
+    ) = None
+    # Issue #2：当 trigger == "unsupported_language" 时记录目标语言，便于 ReproAgent 提示词知情。
+    target_language: str | None = None
+
+
+# Issue #2 第二步：ReproAgent / RefuteAgent / Behavior Oracle 三层都会复用这个 payload。
+# 现阶段（Step 2）只接 ReproAgent，所以字段以“复现/反驳”为主，留有 layer 字段方便后续扩展。
+class CrossVerificationPayload(CodeCrossModel):
+    """LLM 交叉验证一次调用的结构化产物。
+
+    设计原则：
+    - 全部字段都让 LLM 在 JSON 模式下输出，executor 不解析自由文本。
+    - 用 status 直接驱动 TestStatus 的 cross_* 取值，避免在 board 里再做字符串拼凑。
+    - abstain_reason 必须在 status == "abstain" 时给出；其它状态下保持空字符串。
+    """
+
+    layer: Literal["repro_agent", "refute_agent", "behavior_oracle"] = "repro_agent"
+    model: str = ""
+    status: Literal["confirmed", "supported", "refuted", "inconclusive", "abstain"] = "inconclusive"
+    reasoning: str = ""
+    reproduction_steps: list[str] = Field(default_factory=list)
+    expected_observation: str = ""
+    counter_examples: list[str] = Field(default_factory=list)
+    abstain_reason: str = ""
+    # 给 Board 留一个“证据强度”提示位：模型 confirm/refute 给 strong，
+    # supported/inconclusive 给 medium/weak。不在这里硬编码具体字符串，
+    # 留给 board 统一用 EvidenceStrength 字面量映射。
+    suggested_strength: EvidenceStrength = "weak"
 
 
 class TestResult(CodeCrossModel):
@@ -231,6 +304,13 @@ class TestResult(CodeCrossModel):
     error_type: str = ""
     is_reproducible: bool = False
     related_finding_ids: list[str] = Field(default_factory=list)
+    # Issue #2：区分一条 TestResult 是 pytest 跑出来的还是 LLM 交叉验证产出的。
+    # 默认 "pytest" 保持向前兼容；只有 cross verification 分支会写入 "llm_cross_verification"。
+    evidence_kind: EvidenceKind = "pytest"
+    # Issue #2：仅当 evidence_kind == "llm_cross_verification" 时填充。
+    # 拆出独立 payload 的好处：pytest 字段（exit_code/stdout/stderr）保持纯净，
+    # 模型交叉验证的复现步骤、反例、abstain 原因不会污染 pytest 解析逻辑。
+    cross_payload: "CrossVerificationPayload | None" = None
 
 
 class TestRound(CodeCrossModel):

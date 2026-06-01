@@ -281,6 +281,12 @@ def executor_node(state: CodeCrossState) -> dict[str, Any]:
         project_root=state["project_root"],
         round_index=state["round_index"],
         runner_config=state["config"].runner_config,
+        # Issue #2：把 findings / code_context / project_config 一起递给 executor，
+        # 让它在 test_type == "llm_cross_verification" 时能找到 finding 上下文并
+        # 调用 ReproAgent。普通 pytest 路径不会用到这些字段。
+        findings=state.get("findings", []),
+        code_context=state.get("code_context"),
+        project_config=state["config"],
     )
     all_results = [*state.get("all_test_results", []), *results]
     return {"test_results": results, "all_test_results": all_results}

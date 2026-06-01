@@ -85,6 +85,14 @@ class RunnerConfig:
             "Remove-Item",
         ]
     )
+    # Issue #2：LLM 交叉验证 Fallback 的预算。
+    # - enabled=False 时整条 fallback 路径关闭，executor 仍然返回 not_testable，
+    #   行为与历史一致；这样新功能可以灰度开关，避免一次性放出来。
+    # - max_per_round 限制单轮最多调用多少次 ReproAgent（每次都要花模型预算）。
+    # - timeout_seconds 单独于 pytest 的 test_timeout_seconds，因为模型调用通常更慢。
+    cross_verification_enabled: bool = True
+    cross_verification_max_per_round: int = 4
+    cross_verification_timeout_seconds: int = 60
 
 
 @dataclass(slots=True)
@@ -231,6 +239,20 @@ def load_project_config(
         api_key_env="ANTHROPIC_API_KEY",
         base_url_env="ANTHROPIC_BASE_URL",
     )
+    # Issue #2：LLM 交叉验证 ReproAgent 的角色配置。
+    # 默认走 Anthropic：reviewer 已经是 DeepSeek + Anthropic 的组合，
+    # ReproAgent 选 Anthropic 是为了在 fallback 路径上仍然保持“跨家族”独立性，
+    # 避免同一个 deepseek 模型既出 finding 又自我确认。
+    # 用户可以通过更换 ANTHROPIC_MODEL 或在 .env 里把 base_url 指到自家网关来切换。
+    repro_agent = ModelSettings(
+        role="repro_agent",
+        provider="anthropic",
+        model=anthropic_model,
+        focus="cross-verification of pytest-unavailable findings",
+        temperature=0.0,
+        api_key_env="ANTHROPIC_API_KEY",
+        base_url_env="ANTHROPIC_BASE_URL",
+    )
 
     return ProjectConfig(
         reviewers=[deepseek, second],
@@ -244,6 +266,7 @@ def load_project_config(
             "targeted_reviewer": targeted,
             "evaluator": evaluator,
             "high_risk_reviewer": high_risk,
+            "repro_agent": repro_agent,
         },
         mock_llm=mock_llm,
     )

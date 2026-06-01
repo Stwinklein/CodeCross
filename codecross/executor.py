@@ -17,7 +17,13 @@ import ast
 from pathlib import Path
 
 from .config import RunnerConfig
-from .schemas import TestCase, TestResult
+from .schemas import (
+    CodeContext,
+    CrossVerificationPayload,
+    Finding,
+    TestCase,
+    TestResult,
+)
 
 
 # AST sanitizer 是 V1.1 的“轻量沙箱”：它不是 Docker 那样的系统隔离，
@@ -555,17 +561,66 @@ def execute_test_cases(
     project_root: str | Path,
     round_index: int,
     runner_config: RunnerConfig,
+    findings: list[Finding] | None = None,
+    code_context: CodeContext | None = None,
+    project_config: "ProjectConfig | None" = None,
 ) -> list[TestResult]:
-    """按当前轮预算执行一批 TestCase。"""
+    """按当前轮预算执行一批 TestCase。
+
+    Issue #2 第一/二步：当 ``test_case.test_type == "llm_cross_verification"`` 时，
+    走 ReproAgent 而不是 pytest。三个新参数都标了默认 None，是为了不破坏现有
+    调用方（workflow / 旧测试）。``project_config`` 缺失时，cross 分支会显式标
+    skipped 而不是悄悄退化。
+    """
+
+    # finding_id -> Finding，方便交叉验证分支按测试用例上的 related_finding_ids 反查。
+    finding_map: dict[str, Finding] = {f.finding_id: f for f in (findings or [])}
 
     results: list[TestResult] = []
     # select_next_verification_targets 已经限制了“本轮最多验证多少 finding”。
     # Test Author 可能会再加正常路径对照用例，所以 executor 最多执行 2 倍测试数；
     # 超出预算的测试会显式标记 skipped，而不是静默丢失。
     execution_limit = runner_config.max_tests_per_round * 2
+    # cross verification 单独再加一道预算闸：模型调用比 pytest 慢且贵，
+    # 必须按 cross_verification_max_per_round 卡住数量。计数放循环外，
+    # 这样所有溢出的 cross 用例都收敛到同一个 skipped 原因。
+    cross_budget = runner_config.cross_verification_max_per_round
+    cross_used = 0
     for test_case in test_cases[:execution_limit]:
         # static_check 的 test_code 仍然是 Python/pytest 代码，只是语义上表示
         # “读源码做静态断言”。WebAPI 这类 JS 项目短期就靠它提供可执行证据。
+        if test_case.test_type == "llm_cross_verification":
+            if not runner_config.cross_verification_enabled:
+                results.append(
+                    _skipped_result(
+                        test_case,
+                        round_index,
+                        "Cross verification disabled by runner_config.cross_verification_enabled.",
+                        error_type="cross_verification_disabled",
+                    )
+                )
+                continue
+            if cross_used >= cross_budget:
+                results.append(
+                    _skipped_result(
+                        test_case,
+                        round_index,
+                        f"Cross verification budget exhausted ({cross_budget}/round).",
+                        error_type="cross_verification_budget_exceeded",
+                    )
+                )
+                continue
+            cross_used += 1
+            results.append(
+                _run_cross_verification(
+                    test_case,
+                    round_index=round_index,
+                    finding_map=finding_map,
+                    code_context=code_context,
+                    project_config=project_config,
+                )
+            )
+            continue
         if test_case.test_type not in {"pytest", "static_check"}:
             results.append(
                 _skipped_result(
@@ -594,3 +649,125 @@ def execute_test_cases(
             )
         )
     return results
+
+
+def _cross_status_to_test_status(status: str) -> str:
+    """把 CrossVerificationPayload.status 翻译成 TestResult.status。
+
+    单独抽出来：board 想从 TestStatus 反推“是不是 cross 类”时，只需要
+    检查前缀 ``cross_``，不必再依赖 evidence_kind。
+    """
+
+    mapping = {
+        "confirmed": "cross_confirmed",
+        "supported": "cross_supported",
+        "refuted": "cross_refuted",
+        "inconclusive": "cross_inconclusive",
+    }
+    return mapping.get(status, "cross_inconclusive")
+
+
+def _run_cross_verification(
+    test_case: TestCase,
+    *,
+    round_index: int,
+    finding_map: dict[str, Finding],
+    code_context: CodeContext | None,
+    project_config: "ProjectConfig | None",
+) -> TestResult:
+    """LLM 交叉验证执行入口。
+
+    设计要点：
+    - 永远返回 TestResult。模型失败、配置缺失、finding 找不到，全部表达为
+      ``status=cross_inconclusive`` + 具体 ``failure_summary``，这样 board
+      不需要分支处理 None。
+    - 选 finding 的策略简单：取 related_finding_ids[0] 对应的 Finding。
+      如果 reviewer 没填这个字段，executor 兜不住，直接给 inconclusive。
+    """
+
+    # 延迟导入避免触发循环：executor 不应该在 import 期就拉起 cross_verification 包，
+    # 因为后者依赖 llm.py，而 llm.py 又会在被 import 时延伸到 langchain，
+    # 普通 pytest 路径并不需要这些。
+    from .config import ProjectConfig
+    from .cross_verification.repro_agent import run_repro_agent
+
+    if project_config is None or not isinstance(project_config, ProjectConfig):
+        return _build_cross_result(
+            test_case=test_case,
+            round_index=round_index,
+            payload=CrossVerificationPayload(
+                layer="repro_agent",
+                model="unknown",
+                status="inconclusive",
+                reasoning=(
+                    "Cross verification 触发，但 executor 未拿到 ProjectConfig；"
+                    "调用方需要在 execute_test_cases 里传 project_config。"
+                ),
+                abstain_reason="missing project_config",
+                suggested_strength="weak",
+            ),
+        )
+
+    related = test_case.related_finding_ids or []
+    finding = next((finding_map[fid] for fid in related if fid in finding_map), None)
+    if finding is None:
+        return _build_cross_result(
+            test_case=test_case,
+            round_index=round_index,
+            payload=CrossVerificationPayload(
+                layer="repro_agent",
+                model="unknown",
+                status="inconclusive",
+                reasoning=(
+                    "Cross verification 触发，但 test_case.related_finding_ids 没有"
+                    "命中任何 Finding，无法判定。"
+                ),
+                abstain_reason="finding_not_found",
+                suggested_strength="weak",
+            ),
+        )
+
+    payload = run_repro_agent(
+        finding=finding,
+        test_case=test_case,
+        code_context=code_context,
+        config=project_config,
+        trigger=test_case.cross_verification_trigger,
+    )
+    return _build_cross_result(
+        test_case=test_case,
+        round_index=round_index,
+        payload=payload,
+    )
+
+
+def _build_cross_result(
+    *,
+    test_case: TestCase,
+    round_index: int,
+    payload: CrossVerificationPayload,
+) -> TestResult:
+    """把 CrossVerificationPayload 包成 TestResult。"""
+
+    status = _cross_status_to_test_status(payload.status)
+    failure_summary_parts: list[str] = []
+    if payload.reasoning:
+        failure_summary_parts.append(payload.reasoning)
+    if payload.abstain_reason:
+        failure_summary_parts.append(f"abstain_reason: {payload.abstain_reason}")
+    return TestResult(
+        test_case_id=test_case.test_case_id,
+        round_index=round_index,
+        status=status,  # type: ignore[arg-type]
+        exit_code=None,
+        stdout="",
+        stderr="",
+        duration_ms=0,
+        failure_summary="\n".join(failure_summary_parts),
+        # error_type 用 trigger 字段：board / 报告层据此说“为什么这条没跑 pytest”。
+        error_type=test_case.cross_verification_trigger or "llm_cross_verification",
+        is_reproducible=payload.status == "confirmed",
+        related_finding_ids=list(test_case.related_finding_ids),
+        evidence_kind="llm_cross_verification",
+        cross_payload=payload,
+    )

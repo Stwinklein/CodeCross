@@ -267,3 +267,94 @@ def test_final_report_localizes_and_deduplicates_findings():
     assert "Reviewer identified a blocking issue" not in report
     assert "High risk review confirms" not in report
     assert "Tests and reviewers indicate" not in report
+
+
+def test_infer_target_language_covers_known_extensions():
+    """The deterministic inference table should cover the languages we ship triggers for.
+
+    The CodeCross Issue #2 fallback only fires when ``target_language`` is set, so the
+    inference helper is the seam that decides whether a JS / Vue / Go file ever gets
+    LLM cross-verification. Lock the contract for the languages we currently care about.
+    """
+
+    assert agents._infer_target_language("src/utils/oauthRedirect.js") == "javascript"
+    assert agents._infer_target_language("src/utils/Helpers.TS") == "typescript"
+    assert agents._infer_target_language("frontend/App.vue") == "vue"
+    assert agents._infer_target_language("backend/main.go") == "go"
+    assert agents._infer_target_language("examples/sample_project/math_utils.py") == "python"
+
+
+def test_infer_target_language_returns_none_for_unknown_or_empty():
+    """Unknown / suffixless paths must NOT default to a fake language.
+
+    Returning a wrong language would fool ``detect_cross_verification_trigger`` into
+    burning the LLM budget on a file pytest could have run, so we explicitly require
+    ``None`` for ambiguous inputs.
+    """
+
+    assert agents._infer_target_language(None) is None
+    assert agents._infer_target_language("") is None
+    assert agents._infer_target_language("Makefile") is None
+    assert agents._infer_target_language("src/some_dir/") is None
+    assert agents._infer_target_language("weird.unknownext") is None
+
+
+def test_normalize_test_batch_fills_target_language_from_target_file():
+    """``_normalize_test_batch`` should backfill ``target_language`` for cases that
+    forgot it. The real trigger (cross_verification.triggers) keys off this field
+    and the LLM is unreliable about emitting it, so the deterministic backfill is
+    what makes the unsupported_language path fire on JS PRs.
+    """
+
+    case = TestCase(
+        source_agent="mock_test_author_agent",
+        related_finding_ids=["finding_js"],
+        target_file="src/utils/oauthRedirect.js",
+        target_symbol="buildOAuthRedirect",
+        test_name="test_build_oauth_redirect_open_redirect",
+        test_code="def test_build_oauth_redirect_open_redirect():\n    assert True\n",
+        expected_behavior="Open redirect should be blocked.",
+    )
+    from codecross.schemas import TestCaseBatch  # local import keeps file-level imports tidy
+
+    batch = agents._normalize_test_batch(TestCaseBatch(test_cases=[case]), round_index=1)
+
+    assert batch.test_cases[0].target_language == "javascript"
+
+
+def test_normalize_test_batch_preserves_explicit_target_language():
+    """If the model already supplied a target_language we trust it, even when the
+    file extension would map elsewhere. This keeps the door open for hand-written
+    Python tests that exercise non-Python code via subprocess.
+    """
+
+    case = TestCase(
+        source_agent="mock_test_author_agent",
+        related_finding_ids=["finding_mixed"],
+        target_file="src/utils/oauthRedirect.js",
+        target_symbol="buildOAuthRedirect",
+        test_name="test_build_oauth_redirect_python_harness",
+        test_code="def test_build_oauth_redirect_python_harness():\n    assert True\n",
+        expected_behavior="Run the JS via a Python harness.",
+        target_language="python",
+    )
+    from codecross.schemas import TestCaseBatch
+
+    batch = agents._normalize_test_batch(TestCaseBatch(test_cases=[case]), round_index=1)
+
+    assert batch.test_cases[0].target_language == "python"
+
+
+def test_reporting_labels_include_cross_verification_statuses():
+    """The PR comment shows ``verification_text(status)``; without these labels the
+    UI silently falls back to the raw status (``cross_supported``), which made the
+    LLM-cross-verification path indistinguishable from pytest in production. Lock
+    the four cross_* statuses so we never regress that fix.
+    """
+
+    from codecross import reporting
+
+    assert reporting.verification_text("cross_supported") == "模型交叉验证支持"
+    assert reporting.verification_text("cross_refuted") == "模型交叉验证反驳"
+    assert reporting.verification_text("cross_inconclusive") == "模型交叉验证证据不足"
+    assert reporting.verification_text("needs_human_review") == "需人工裁定"
