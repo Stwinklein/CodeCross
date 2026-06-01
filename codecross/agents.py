@@ -946,16 +946,70 @@ def targeted_reviewer_agent(
         )
 
 
+# Issue #3: 当 PR 仅修改 CodeCross 自身的集成 workflow / runner 代码时，
+# reviewer 仍会客观挑出 fallback / shell 边界这类通用 CI 风险，evaluator
+# 默认会判 high 进而触发高风险二次复核，导致外部"修-审-修-审"循环不收敛。
+# 这里只在 evaluator 阶段做语义降级，不改变 reviewer 链路本身。
+SELF_REFERENCE_PATH_PREFIXES: tuple[str, ...] = (
+    ".github/workflows/codecross",
+    ".codecross-runner/",
+    ".codecross-runner",
+)
+SELF_REFERENCE_PATH_EXACT: frozenset[str] = frozenset(
+    {".github/workflows/codecross-pr-review.yml"}
+)
+SELF_REFERENCE_NOTE = (
+    "本次 PR 仅修改 CodeCross 自身的集成入口或运行载体代码（例如 "
+    ".github/workflows/codecross-pr-review.yml 或 .codecross-runner/）。"
+    "为避免 reviewer 在自指语境下持续给出 high/critical 评分形成"
+    "‘修-审-修-审’循环，evaluator 已按自指规则降级到 medium，"
+    "并跳过高风险二次复核。原始 finding 仍保留在结构化 JSON 产物中，请人工复核。"
+)
+
+
+def _normalize_self_reference_path(path: str) -> str:
+    cleaned = (path or "").strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned
+
+
+def is_self_referential_review(review_plan: ReviewPlan | None) -> bool:
+    """判断本次 PR 是否仅修改 CodeCross 自身的集成 / 运行载体代码。
+
+    判据：review_plan.changed_files 非空，且每一条都落在
+    SELF_REFERENCE_PATH_PREFIXES 或 SELF_REFERENCE_PATH_EXACT 中。
+    空 changed_files 不视为自指（避免 planner 失败时误降级）。
+    """
+
+    if review_plan is None:
+        return False
+    files = [_normalize_self_reference_path(item) for item in review_plan.changed_files]
+    files = [item for item in files if item]
+    if not files:
+        return False
+    for path in files:
+        if path in SELF_REFERENCE_PATH_EXACT:
+            continue
+        if any(path.startswith(prefix) for prefix in SELF_REFERENCE_PATH_PREFIXES):
+            continue
+        return False
+    return True
+
+
 def evaluator_agent(
     *,
     reviewer_results: list[ReviewerResult],
     findings: list[Finding],
     board_summary: BoardSummary,
     config: ProjectConfig,
+    review_plan: ReviewPlan | None = None,
 ) -> EvaluatorReport:
     """Rule-first Evaluator。
 
     风险等级先由 Board 状态和 evidence 决定，确保多次运行结果稳定。
+    Issue #3：自指 PR（仅改 CodeCross 自身集成代码）会被强制降级到 medium，
+    避免外部循环。
     """
 
     verifications = board_summary.finding_verifications
@@ -1000,10 +1054,28 @@ def evaluator_agent(
         risk_level = "low"
         reasoning = "没有剩余已被证据支持的中高风险 finding。"
 
+    self_reference = is_self_referential_review(review_plan)
+    if self_reference and risk_level in {"high", "critical"}:
+        # 仅降级阻断级评分，medium/low/unknown 维持原判
+        risk_level = "medium"
+        reasoning = f"{SELF_REFERENCE_NOTE} 原始判断理由：{reasoning}"
+    elif self_reference:
+        reasoning = f"{SELF_REFERENCE_NOTE} 原始判断理由：{reasoning}"
+
     top_findings = [
         finding.finding_id
         for finding in sorted(supported + unresolved_high, key=lambda item: item.severity, reverse=True)
     ][:5]
+    needs_high_risk_review = risk_level in {"high", "critical"} and not self_reference
+    if self_reference:
+        recommended_action = (
+            "本次为 CodeCross 自身集成审查，已按自指规则降级。"
+            "请人工核对结构化 JSON 产物中的原始 finding 后决定是否合并。"
+        )
+    elif risk_level in {"high", "critical"}:
+        recommended_action = "阻断合并，或要求修复后再合并。"
+    else:
+        recommended_action = "先人工确认未解决事项，再按项目策略决定是否合并。"
     return EvaluatorReport(
         risk_level=risk_level,  # type: ignore[arg-type]
         confidence="high" if risk_level in {"low", "high", "critical"} else "medium",
@@ -1012,12 +1084,8 @@ def evaluator_agent(
         failed_tests_summary="\n".join(result.failure_summary for result in board_summary.failed_tests),
         coverage_gaps=board_summary.coverage_gaps,
         verification_summary=render_board_markdown(board_summary),
-        recommended_action=(
-            "阻断合并，或要求修复后再合并。"
-            if risk_level in {"high", "critical"}
-            else "先人工确认未解决事项，再按项目策略决定是否合并。"
-        ),
-        needs_high_risk_review=risk_level in {"high", "critical"},
+        recommended_action=recommended_action,
+        needs_high_risk_review=needs_high_risk_review,
         reasoning=reasoning,
     )
 
@@ -1225,7 +1293,12 @@ def render_final_report(
         "\n## 结论摘要\n\n"
         f"{presentation.conclusion_summary}\n\n"
         f"建议动作：{presentation.recommended_action or '无'}\n\n"
-        "## 重点问题\n\n"
+        + (
+            f"> 自指降级说明：{SELF_REFERENCE_NOTE}\n\n"
+            if is_self_referential_review(review_plan)
+            else ""
+        )
+        + "## 重点问题\n\n"
         + ("\n".join(finding_lines) if finding_lines else "无剩余重点问题。")
         + "\n\n"
     )

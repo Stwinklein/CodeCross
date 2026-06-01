@@ -411,6 +411,7 @@ def evaluator_node(state: CodeCrossState) -> dict[str, EvaluatorReport]:
         findings=state.get("findings", []),
         board_summary=state["board_summary"],
         config=state["config"],
+        review_plan=state.get("review_plan"),
     )
     return {"evaluator_report": report}
 

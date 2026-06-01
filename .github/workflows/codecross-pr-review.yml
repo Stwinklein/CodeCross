@@ -6,6 +6,14 @@ name: CodeCross PR Review
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Issue #3: 跳过 CodeCross 自身源码、测试与本 workflow 的自我审查，
+    # 避免 reviewer 把自己当作普通业务代码反复挑出 fallback / shell 边界
+    # 类 high finding，造成‘修-审-修-审’循环。其它路径（README、frontend、
+    # examples 等）仍走完整审查流程。
+    paths-ignore:
+      - '.github/workflows/codecross-pr-review.yml'
+      - 'codecross/**'
+      - 'tests/**'
 
 permissions:
   contents: read
