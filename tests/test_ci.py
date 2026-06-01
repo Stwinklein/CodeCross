@@ -576,6 +576,79 @@ def test_build_pr_comment_table_drops_refuted_findings():
     assert "_暂无需要展示的关键 finding。_" in comment
 
 
+def test_build_pr_comment_collapses_duplicate_top_findings():
+    """同一风险被多个 reviewer 报告时，顶层评论只保留一条代表项。"""
+
+    primary = Finding(
+        source_reviewer="logic_reviewer",
+        model="deepseek/deepseek-chat",
+        category="security",
+        severity="high",
+        file_path="src/utils/oauthRedirect.js",
+        line_range=LineRange(start=6, end=9),
+        problem="buildRedirectUrl does not encode query parameters, enabling open redirect.",
+        evidence="`next` is interpolated directly into the URL.",
+        impact="Attackers can redirect users to a phishing site.",
+        suggestion=(
+            "Use `encodeURIComponent()` on `next` and `state` before interpolation, "
+            "e.g. `return `${origin}?next=${encodeURIComponent(next)}``. "
+            "Additionally validate trusted origins."
+        ),
+    )
+    duplicate = Finding(
+        source_reviewer="security_reviewer",
+        model="anthropic/claude-opus-4-6",
+        category="oauth",
+        severity="medium",
+        file_path="src/utils/oauthRedirect.js",
+        line_range=LineRange(start=7, end=8),
+        problem="buildRedirectUrl does not encode query parameters (next and state).",
+        evidence="Both values are interpolated raw.",
+        impact="OAuth redirect URLs may be malformed or exploitable.",
+        suggestion="Use encodeURIComponent on both next and state before appending to the URL.",
+    )
+    state = _sample_state()
+    state["reviewer_results"] = [
+        ReviewerResult(
+            reviewer_name="logic_reviewer",
+            model="deepseek/deepseek-chat",
+            findings=[primary],
+        ),
+        ReviewerResult(
+            reviewer_name="security_reviewer",
+            model="anthropic/claude-opus-4-6",
+            findings=[duplicate],
+        ),
+    ]
+    state["findings"] = [primary, duplicate]
+    state["board_summary"] = BoardSummary(
+        reviewer_count=2,
+        finding_count=2,
+        test_case_count=1,
+        failed_count=1,
+        finding_verifications={
+            primary.finding_id: FindingVerification(
+                finding_id=primary.finding_id,
+                status="supported",
+            ),
+            duplicate.finding_id: FindingVerification(
+                finding_id=duplicate.finding_id,
+                status="supported",
+            ),
+        },
+    )
+
+    comment = build_pr_comment(state)
+
+    assert "### Blocking summary" in comment
+    assert "### 阻塞摘要" in comment
+    assert "Unsafe OAuth redirect URL" in comment
+    assert "`src/utils/oauthRedirect.js:6-9`" in comment
+    assert "`src/utils/oauthRedirect.js:7-8`" not in comment
+    assert "- [ ] Use `encodeURIComponent()` on `next` and `state` before interpolation" in comment
+    assert "- [ ] Use `encodeURIComponent()` on `next` and `state` before interpolation, e.g." not in comment
+
+
 def test_build_pr_comment_webapi_pr10_keeps_all_risk_items():
     """WebAPI PR #10 的 5 个风险项都应出现在新版 PR 评论顶层。"""
 

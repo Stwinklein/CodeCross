@@ -316,14 +316,129 @@ def _first_sentence(text: str, fallback: str = "—", *, max_chars: int = 180) -
 
     cleaned = _flatten_table_text(text, fallback)
     cleaned = re.sub(r"^(?:[-*]\s+|\[[ xX]\]\s+)", "", cleaned).strip()
-    match = re.match(r"(.+?[.!?。！？])(?:\s|$)", cleaned)
+    # ``e.g.`` / ``i.e.`` often appear right before a code example. Treating
+    # their periods as sentence boundaries produces useless checklist items like
+    # "Use encodeURIComponent(), e.g.".
+    protected = (
+        cleaned.replace("e.g.", "e_g_")
+        .replace("i.e.", "i_e_")
+        .replace("E.g.", "E_g_")
+        .replace("I.e.", "I_e_")
+    )
+    match = re.match(r"(.+?[.!?。！？])(?:\s|$)", protected)
     if match and len(match.group(1).strip()) >= 8:
         cleaned = match.group(1).strip()
+        cleaned = (
+            cleaned.replace("e_g_", "e.g.")
+            .replace("i_e_", "i.e.")
+            .replace("E_g_", "E.g.")
+            .replace("I_e_", "I.e.")
+        )
     return _truncate_inline(cleaned, max_chars=max_chars)
+
+
+def _checklist_action(text: str, fallback: str = "—", *, max_chars: int = 180) -> str:
+    """Extract a task-list action without dragging example code into the task."""
+
+    cleaned = _flatten_table_text(text, fallback)
+    cleaned = re.split(r"\s*(?:,?\s+e\.g\.|，?例如[:：]?)\s*", cleaned, maxsplit=1)[0]
+    cleaned = cleaned.rstrip(" ,，;；:")
+    if cleaned and cleaned[-1] not in ".。!?！？":
+        cleaned += "."
+    return _first_sentence(cleaned, fallback, max_chars=max_chars)
+
+
+def _finding_topic_key(finding: Finding) -> str:
+    """把相似 finding 归到同一个人工可读风险主题。
+
+    两个 reviewer 很容易用不同 wording 报同一个风险。顶层 PR 评论应该
+    帮读者聚合它们；完整报告仍保留所有原始 reviewer 输出。
+    """
+
+    text = " ".join(
+        [
+            finding.category,
+            finding.file_path,
+            finding.problem,
+            finding.impact,
+            finding.suggestion,
+        ]
+    ).lower()
+    file_path = finding.file_path.lower()
+
+    if "workflow" in file_path and "fallback" in text and "comment" in text:
+        return f"{finding.file_path}:workflow-fallback-comment"
+    if "workflow" in file_path and (
+        ("runner" in text and "ref" in text)
+        or "temporary test ref" in text
+        or "pinned by sha" in text
+    ):
+        return f"{finding.file_path}:workflow-runner-ref"
+    if "state" in text and (
+        re.search(r"\b(log|logs|logged|logging|plaintext|console)\b", text) is not None
+    ):
+        return f"{finding.file_path}:oauth-state-log"
+    if "provider" in text and any(
+        word in text for word in ("unknown", "undefined", "invalid", "not found")
+    ):
+        return f"{finding.file_path}:oauth-provider-validation"
+    if ("duplicate" in text or "maintenance" in text) and "provider" in text:
+        return f"{finding.file_path}:provider-lookup-duplication"
+    if any(word in text for word in ("redirect", "next", "query parameter")) and any(
+        word in text for word in ("encode", "validation", "allowlist", "open redirect")
+    ):
+        return f"{finding.file_path}:oauth-redirect-validation"
+
+    return (
+        f"{finding.file_path}:{finding.line_range.start}:{finding.line_range.end}:"
+        f"{finding.category.lower()}:{_first_sentence(finding.problem, max_chars=80).lower()}"
+    )
+
+
+TOPIC_TITLES_EN: dict[str, str] = {
+    "workflow-fallback-comment": "Unsafe fallback PR comment",
+    "workflow-runner-ref": "Temporary CodeCross runner ref",
+    "oauth-state-log": "OAuth state logged in plaintext",
+    "oauth-provider-validation": "Missing provider validation",
+    "provider-lookup-duplication": "Duplicated provider lookup",
+    "oauth-redirect-validation": "Unsafe OAuth redirect URL",
+}
+TOPIC_TITLES_ZH: dict[str, str] = {
+    "workflow-fallback-comment": "回退 PR 评论未清理输入",
+    "workflow-runner-ref": "临时 CodeCross runner ref",
+    "oauth-state-log": "OAuth state 明文日志",
+    "oauth-provider-validation": "缺少 provider 校验",
+    "provider-lookup-duplication": "provider 查找逻辑重复",
+    "oauth-redirect-validation": "不安全的 OAuth 重定向 URL",
+}
+
+
+def _topic_slug(finding: Finding) -> str:
+    """Extract the normalized topic slug from ``_finding_topic_key``."""
+
+    return _finding_topic_key(finding).rsplit(":", 1)[-1]
 
 
 def _finding_title(finding: Finding, problem_text: str | None = None) -> str:
     """从 problem 字段里提取一段适合放在卡片标题里的短标题。"""
+
+    topic_title = TOPIC_TITLES_EN.get(_topic_slug(finding))
+    if topic_title:
+        return topic_title
+
+    problem = _flatten_table_text(problem_text or finding.problem)
+    colon_title = re.split(r"[:：]", problem, maxsplit=1)[0].strip()
+    if 4 <= len(colon_title) <= 80 and colon_title != problem:
+        return colon_title
+    return _first_sentence(problem, max_chars=80)
+
+
+def _finding_title_zh(finding: Finding, problem_text: str | None = None) -> str:
+    """中文卡片标题；没有已知主题时从中文 problem 中提取短标题。"""
+
+    topic_title = TOPIC_TITLES_ZH.get(_topic_slug(finding))
+    if topic_title:
+        return topic_title
 
     problem = _flatten_table_text(problem_text or finding.problem)
     colon_title = re.split(r"[:：]", problem, maxsplit=1)[0].strip()
@@ -376,27 +491,36 @@ def _select_table_findings(
     镜像段一定从同一组 finding 出发，行数一致、行序一致。规则：
       1. **过滤**：board 已经把它判为 refuted / cross_refuted 的，不展示
          （和 _render_key_findings 一致，避免假阳性占据有限的顶层空间）。
-      2. **去重**：用 (severity, file, line range, category) 当 key，多个
-         reviewer 命中同一处时只显示第一条，后面的并入"similar findings
-         merged" 提示（这里 PR 评论简化成只展示第一条，提示放回 final
-         report 里）。
+      2. **去重**：先按风险主题聚合（比如 open redirect / state 日志 /
+         provider 校验）。多个 reviewer 命中同类问题时只显示严重度最高的
+         代表项，避免顶层评论被重复 finding 淹没。
       3. **排序**：先按 severity（critical→low），再按 file 和起始行号。
       4. **截断**：最多 ``limit`` 条，剩下的让用户去 final report 里看。
     """
 
-    seen: dict[tuple[str, str, int | None, int | None, str], Finding] = {}
+    seen: dict[str, Finding] = {}
     for finding in findings:
         verification_status = _verification_status_for(finding, board_summary)
         if verification_status in {"refuted", "cross_refuted"}:
             continue
-        dedupe_key = (
-            finding.severity,
-            finding.file_path,
-            finding.line_range.start,
-            finding.line_range.end,
-            finding.category.lower(),
+        dedupe_key = _finding_topic_key(finding)
+        current = seen.get(dedupe_key)
+        if current is None:
+            seen[dedupe_key] = finding
+            continue
+
+        # 同一主题里保留最严重、位置更靠前的代表项；完整报告仍保留所有
+        # reviewer 原始输出，所以这里可以大胆为顶层阅读做降噪。
+        current_rank = (
+            SEVERITY_ORDER.get(current.severity, 9),
+            current.line_range.start or 0,
         )
-        seen.setdefault(dedupe_key, finding)
+        candidate_rank = (
+            SEVERITY_ORDER.get(finding.severity, 9),
+            finding.line_range.start or 0,
+        )
+        if candidate_rank < current_rank:
+            seen[dedupe_key] = finding
 
     sorted_findings = sorted(
         seen.values(),
@@ -425,7 +549,10 @@ def _render_findings_table_en(
     for finding in findings:
         severity_label = _severity_badge_en(finding.severity)
         location = _line_location(finding)
-        problem = _escape_table_cell(_flatten_table_text(finding.problem))
+        problem = _escape_table_cell(
+            f"{_finding_title(finding)}: "
+            f"{_first_sentence(finding.problem, max_chars=140)}"
+        )
         lines.append(
             f"| {severity_label} | `{_escape_table_cell(location)}` | {problem} |"
         )
@@ -457,7 +584,10 @@ def _render_findings_table_zh(
         location = _line_location(finding)
 
         problem_text, _, _ = _localized_texts(finding, localized_cells)
-        problem = _escape_table_cell(_flatten_table_text(problem_text))
+        problem = _escape_table_cell(
+            f"{_finding_title_zh(finding, problem_text)}："
+            f"{_first_sentence(problem_text, max_chars=140)}"
+        )
         lines.append(
             f"| {severity_label} | `{_escape_table_cell(location)}` | {problem} |"
         )
@@ -521,7 +651,7 @@ def _render_finding_cards_zh(
             [
                 (
                     f"▸ {_severity_badge_zh(finding.severity).split()[0]} "
-                    f"**{_display_finding_id(index)} · {_finding_title(finding, problem)}**"
+                    f"**{_display_finding_id(index)} · {_finding_title_zh(finding, problem)}**"
                     f"（{severity} · {verification_label}）"
                 ),
                 "",
@@ -543,7 +673,7 @@ def _render_action_checklist_en(findings: list[Finding]) -> str:
     lines: list[str] = []
     seen: set[str] = set()
     for finding in findings:
-        action = _first_sentence(finding.suggestion, finding.problem, max_chars=180)
+        action = _checklist_action(finding.suggestion, finding.problem, max_chars=180)
         key = action.lower()
         if key in seen:
             continue
@@ -565,12 +695,74 @@ def _render_action_checklist_zh(
     seen: set[str] = set()
     for finding in findings:
         _, _, suggestion = _localized_texts(finding, localized_cells)
-        action = _first_sentence(suggestion, finding.suggestion, max_chars=180)
+        action = _checklist_action(suggestion, finding.suggestion, max_chars=180)
         key = action.lower()
         if key in seen:
             continue
         seen.add(key)
         lines.append(f"- [ ] {action}")
+    return "\n".join(lines) + "\n"
+
+
+def _blocking_findings(
+    findings: list[Finding],
+    board_summary: BoardSummary,
+    *,
+    limit: int = 4,
+) -> list[Finding]:
+    """Pick the small set of findings that should drive the merge decision."""
+
+    strong_statuses = {"supported", "cross_supported", "unverified", "needs_human_review"}
+    blocking = [
+        finding
+        for finding in findings
+        if finding.severity in {"critical", "high"}
+        and _verification_status_for(finding, board_summary) in strong_statuses
+    ]
+    return blocking[:limit]
+
+
+def _render_blocking_summary_en(
+    findings: list[Finding],
+    board_summary: BoardSummary,
+) -> str:
+    """Render the short "why are we blocking?" summary before details."""
+
+    blocking = _blocking_findings(findings, board_summary)
+    if not blocking:
+        return "_No high-severity blocking findings in the top set._\n"
+
+    lines: list[str] = []
+    for finding in blocking:
+        icon = _severity_badge_en(finding.severity).split()[0]
+        lines.append(
+            f"- {icon} **{_finding_title(finding)}** at "
+            f"`{_escape_table_cell(_line_location(finding))}` — "
+            f"{_first_sentence(finding.impact or finding.problem, max_chars=150)}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _render_blocking_summary_zh(
+    findings: list[Finding],
+    board_summary: BoardSummary,
+    localized_cells: dict[str, LocalizedFindingCell],
+) -> str:
+    """中文阻塞摘要，和英文摘要使用同一批代表 finding。"""
+
+    blocking = _blocking_findings(findings, board_summary)
+    if not blocking:
+        return "_顶层集合里没有高严重度阻塞项。_\n"
+
+    lines: list[str] = []
+    for finding in blocking:
+        problem, impact, _ = _localized_texts(finding, localized_cells)
+        icon = _severity_badge_zh(finding.severity).split()[0]
+        lines.append(
+            f"- {icon} **{_finding_title_zh(finding, problem)}** at "
+            f"`{_escape_table_cell(_line_location(finding))}` — "
+            f"{_first_sentence(impact or problem, max_chars=150)}"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -715,7 +907,7 @@ def build_pr_comment(
     PR 评论的版面（从上到下）：
         1. 顶部 verdict blockquote：该不该合、风险等级、置信度和一句话理由。
         2. ``Run info`` 折叠块：CI 元数据默认收起，排查时再展开。
-        3. 英文镜像段：三列一览表 → Why 卡片 → Action checklist → 完整报告折叠。
+        3. 英文镜像段：阻塞摘要 → 三列一览表 → Why 卡片 → Action checklist → 完整报告折叠。
         4. 中文镜像段：同一批 finding、同一行序，文案优先用 localized cells。
         5. Reviewer Errors（如有）+ footer。
 
@@ -761,9 +953,17 @@ def build_pr_comment(
     if board_summary is None:
         english_overview = "_No board summary available; see the JSON artifact._\n"
         chinese_overview = "_暂无 Board 汇总数据；请查看 JSON artifact。_\n"
+        english_blocking = "_No board summary available; see the JSON artifact._\n"
+        chinese_blocking = "_暂无 Board 汇总数据；请查看 JSON artifact。_\n"
         english_cards = "_No board summary available; see the JSON artifact._\n"
         chinese_cards = "_暂无 Board 汇总数据；请查看 JSON artifact。_\n"
     else:
+        english_blocking = _render_blocking_summary_en(table_findings, board_summary)
+        chinese_blocking = _render_blocking_summary_zh(
+            table_findings,
+            board_summary,
+            localized_cells,
+        )
         english_overview = _render_findings_table_en(table_findings, board_summary)
         chinese_overview = _render_findings_table_zh(
             table_findings,
@@ -797,6 +997,10 @@ def build_pr_comment(
         "",
         "## 🇬🇧 English",
         "",
+        "### Blocking summary",
+        "",
+        english_blocking.rstrip(),
+        "",
         "### Findings at a glance",
         "",
         english_overview.rstrip(),
@@ -814,6 +1018,10 @@ def build_pr_comment(
         "---",
         "",
         "## 🇨🇳 中文",
+        "",
+        "### 阻塞摘要",
+        "",
+        chinese_blocking.rstrip(),
         "",
         "### 一览",
         "",
