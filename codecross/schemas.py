@@ -446,3 +446,53 @@ class LocalizedReport(CodeCrossModel):
         default="",
         description="Simplified Chinese Markdown translation of the final report.",
     )
+
+
+# ---------------------------------------------------------------------------
+# 方案 B：PR 评论的双语 finding 表格需要"按 finding 翻译几个短字段"。
+# 这里定义两个轻量结构：
+#   - LocalizedFindingCell：单条 finding 的中文 problem/suggestion/impact。
+#   - LocalizedFindingCells：上一层的容器，方便 LLM 一次性返回整批，
+#     也方便在 state 里以 dict[finding_id -> cell] 形式存放和查询。
+# 注意：这里不翻译 severity / verification_status / location 这种结构化
+# 字段。它们在 PR 评论里由代码直接渲染（标签由前端/模板决定），不应该让
+# LLM 自由翻译，否则容易出现"严重 / 严重风险 / Critical"等不一致写法。
+# ---------------------------------------------------------------------------
+class LocalizedFindingCell(CodeCrossModel):
+    """单条 finding 在 PR 评论中文表格里的三个文本单元格。
+
+    finding_id 是关键回填字段：Localizer 必须原样保留它，PR 评论渲染
+    时按 finding_id 拼回结构化数据。如果 LLM 漏返回某条 finding，就回
+    退到英文原文，保证表格永远有内容（不会出现空白单元格）。
+    """
+
+    finding_id: str = Field(
+        description="Original Finding.finding_id; must be returned verbatim.",
+    )
+    problem_zh: str = Field(
+        default="",
+        description="Simplified Chinese translation of Finding.problem (one short line).",
+    )
+    impact_zh: str = Field(
+        default="",
+        description="Simplified Chinese translation of Finding.impact (one short line).",
+    )
+    suggestion_zh: str = Field(
+        default="",
+        description="Simplified Chinese translation of Finding.suggestion (one short line).",
+    )
+
+
+class LocalizedFindingCells(CodeCrossModel):
+    """Finding Cells Localizer Agent 的结构化输出。
+
+    这是一个简单的"批量翻译"产物：输入 N 个 finding 的英文短文本，
+    输出对应 N 条中文翻译。PR 评论按 finding_id 索引到对应中文文本，
+    然后把它和 severity/verification_status 这些结构化字段一起塞进 Markdown
+    表格的中文版。
+    """
+
+    cells: list[LocalizedFindingCell] = Field(
+        default_factory=list,
+        description="Per-finding Chinese translations indexed by finding_id.",
+    )

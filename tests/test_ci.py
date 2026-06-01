@@ -22,6 +22,7 @@ from codecross.schemas import (
     Finding,
     FindingVerification,
     LineRange,
+    LocalizedFindingCell,
     ReviewPlan,
     ReviewerResult,
 )
@@ -281,3 +282,111 @@ def test_read_diff_file_strips_utf8_bom(tmp_path: Path):
     diff_path.write_text("\ufeffdiff --git a/a.py b/a.py\n", encoding="utf-8")
 
     assert read_diff_file(diff_path).startswith("diff --git")
+
+
+# ---------------------------------------------------------------------------
+# 方案 B：PR 评论双语 finding 表格
+# ---------------------------------------------------------------------------
+# 这一组测试聚焦"结构化数据 -> Markdown 表格"这一层，重点保护：
+#   1. 表格结构由代码生成，不受 LLM 输出影响。
+#   2. 中英文行序严格一致；翻译缺失时优雅回退到英文。
+#   3. 危险字符（``|``、换行）不会破坏 Markdown 表格语法。
+
+
+def test_build_pr_comment_renders_bilingual_finding_tables():
+    """PR 评论应同时给出英文表格和中文表格。"""
+
+    state = _sample_state()
+    finding = state["findings"][0]
+    state["localized_finding_cells"] = {
+        finding.finding_id: LocalizedFindingCell(
+            finding_id=finding.finding_id,
+            problem_zh="新分支可能在调用方期望字符串时返回 None。",
+            impact_zh="调用方可能在调用字符串方法时抛 AttributeError。",
+            suggestion_zh="保持字符串契约，或同步更新所有调用方与测试。",
+        )
+    }
+
+    comment = build_pr_comment(state)
+
+    # 英文表格头出现一次。
+    assert "| Severity | Verification | Location | Problem | Suggestion |" in comment
+    # 英文行：severity 标签是代码生成的（不是 schema 字面量小写）。
+    assert "| High | supported | `src/app.py:12-14` |" in comment
+
+    # 中文表格头与中文标签都来自代码常量。
+    assert "| 严重级别 | 验证状态 | 位置 | 问题 | 建议 |" in comment
+    assert "| 高 | 已被证据支持 | `src/app.py:12-14` |" in comment
+    # 中文 problem 文本来自 localizer 翻译产物。
+    assert "新分支可能在调用方期望字符串时返回 None。" in comment
+
+
+def test_build_pr_comment_falls_back_to_english_when_localization_missing():
+    """没有 localized_finding_cells 时中文表格应回退到英文文本（不出现空格子）。"""
+
+    state = _sample_state()
+    state.pop("localized_finding_cells", None)
+
+    comment = build_pr_comment(state)
+
+    # 中文表格存在，但 problem/suggestion 列回退到英文 finding 原文。
+    assert "| 严重级别 | 验证状态 | 位置 | 问题 | 建议 |" in comment
+    assert "The new branch can return None where callers expect a string." in comment
+    # 同一段英文同时出现在英文表格里——也就是行序对齐时双语都能看到。
+    assert comment.count("The new branch can return None where callers expect a string.") >= 2
+
+
+def test_build_pr_comment_escapes_pipes_in_table_cells():
+    """finding 文本里出现 ``|`` 时不能破坏 Markdown 表格结构。"""
+
+    state = _sample_state()
+    finding = state["findings"][0]
+    finding.problem = "Pipe in problem | should be escaped"
+    finding.suggestion = "Use replace('|', '/')"
+    state["localized_finding_cells"] = {
+        finding.finding_id: LocalizedFindingCell(
+            finding_id=finding.finding_id,
+            problem_zh="problem 中含有 | 应当转义",
+            impact_zh="impact 占位",
+            suggestion_zh="建议中也含 | 字符",
+        )
+    }
+
+    comment = build_pr_comment(state)
+
+    # 转义后的反斜杠加竖线必须出现，而不是裸 ``|``。
+    assert r"Pipe in problem \| should be escaped" in comment
+    assert r"Use replace('\|', '/')" in comment
+    assert r"problem 中含有 \| 应当转义" in comment
+
+    # 验证表格仍然是合法 5 列：找到表格行数 = 1 标题 + 1 分隔 + N 行数据。
+    # 这里只验证数据行的列数，因为单元格里转义后仍然是 5 个 ``|`` 分隔符。
+    for line in comment.splitlines():
+        if line.startswith("| High |") or line.startswith("| 高 |"):
+            # 5 列产生 6 个 ``|``（含两端）。转义后的 ``\|`` 不能被算成分隔符。
+            unescaped = line.replace(r"\|", "")
+            assert unescaped.count("|") == 6, f"Broken table row: {line!r}"
+
+
+def test_build_pr_comment_table_drops_refuted_findings():
+    """已被证据反驳的 finding 不应出现在 PR 评论的表格里。"""
+
+    state = _sample_state()
+    finding = state["findings"][0]
+    state["board_summary"].finding_verifications[finding.finding_id] = (
+        FindingVerification(
+            finding_id=finding.finding_id,
+            status="refuted",
+            reason="Test passed; problem could not be reproduced.",
+        )
+    )
+
+    comment = build_pr_comment(state)
+
+    # finding 行不应出现在英文/中文表格里。
+    assert "| High | refuted |" not in comment
+    assert "| 高 | 已被证据反驳 |" not in comment
+    # 但 finding 文本仍然可能出现在 final_report_en 自由文本里——
+    # 这里我们只关心表格区段。空表格会显示一句"暂无"。
+    assert "_No remaining key findings to display._" in comment
+    assert "_暂无需要展示的关键 finding。_" in comment

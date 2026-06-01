@@ -351,3 +351,88 @@ def test_report_localizer_mock_returns_chinese_section():
 
     assert "CodeCross 最终审查报告（中文）" in localized
     assert "Mock 模式未调用中文化模型" in localized
+
+
+# ---------------------------------------------------------------------------
+# 方案 B 新增测试
+# ---------------------------------------------------------------------------
+
+
+def test_short_text_preserves_paragraph_breaks():
+    """_short_text 修复后应保留段落（双换行）但折叠段内多余空白。"""
+
+    text = (
+        "F-001 (critical): JWT signature verification missing.\n\n"
+        "F-002 (high): Expiration\n  check uses string comparison."
+    )
+
+    cleaned = agents._short_text(text)
+
+    # 段间分隔保留为 \n\n。
+    assert "\n\n" in cleaned
+    # 段内多余空白被压成一个空格——"Expiration\n  check" -> "Expiration check"。
+    assert "Expiration check" in cleaned
+    # 第一段完整保留。
+    assert cleaned.startswith("F-001 (critical): JWT signature verification missing.")
+
+
+def test_short_text_falls_back_when_empty():
+    """空字符串/纯空白应触发 fallback，避免 PR 评论里出现空格子。"""
+
+    assert agents._short_text("") == "not provided"
+    assert agents._short_text("   \n\n  ") == "not provided"
+    assert agents._short_text(None) == "not provided"  # type: ignore[arg-type]
+
+
+def test_finding_cells_localizer_mock_returns_per_finding_translation():
+    """Mock 模式下应给每条 finding 都返回带 finding_id 的中文 cell。"""
+
+    findings = [
+        Finding(
+            source_reviewer="logic_reviewer",
+            model="mock",
+            category="runtime",
+            severity="high",
+            file_path="src/app.py",
+            line_range=LineRange(start=12, end=14),
+            problem="Bad branch returns None",
+            evidence="evidence",
+            impact="callers crash",
+            suggestion="preserve string contract",
+        ),
+        Finding(
+            source_reviewer="logic_reviewer",
+            model="mock",
+            category="security",
+            severity="critical",
+            file_path="src/auth.py",
+            line_range=LineRange(start=20),
+            problem="No signature verification",
+            evidence="evidence",
+            impact="auth bypass",
+            suggestion="use jsonwebtoken",
+        ),
+    ]
+    config = load_project_config(mock_llm=True)
+
+    cells = agents.finding_cells_localizer_agent(findings=findings, config=config)
+
+    assert set(cells.keys()) == {finding.finding_id for finding in findings}
+    for finding in findings:
+        cell = cells[finding.finding_id]
+        # mock 文本里要带原英文，证明 finding_id 和原文都正确路由到了对应 cell。
+        assert finding.problem in cell.problem_zh
+        assert finding.suggestion in cell.suggestion_zh
+        # finding_id 必须原样回填（PR 评论要靠它做索引）。
+        assert cell.finding_id == finding.finding_id
+
+
+def test_finding_cells_localizer_returns_empty_when_no_findings():
+    """没有 finding 时应直接返回空字典，不调用模型。"""
+
+    cells = agents.finding_cells_localizer_agent(
+        findings=[],
+        config=load_project_config(mock_llm=True),
+    )
+
+    assert cells == {}

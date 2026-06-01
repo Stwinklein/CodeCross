@@ -26,6 +26,8 @@ from .schemas import (
     Finding,
     HighRiskReviewReport,
     LineRange,
+    LocalizedFindingCell,
+    LocalizedFindingCells,
     LocalizedReport,
     ReviewPlan,
     ReviewerResult,
@@ -1245,8 +1247,43 @@ def _join_or_none(items: list[str], *, limit: int | None = None) -> str:
 
 
 def _short_text(text: str, fallback: str = "not provided") -> str:
-    cleaned = " ".join((text or "").split())
-    return cleaned or fallback
+    """规范化 LLM/工具产出的自由文本，但保留段落结构。
+
+    历史问题（PR 评论"内容拥挤"的根因）：
+        旧实现是 ``" ".join(text.split())``，``str.split()`` 不传参数时会按
+        所有空白拆分，导致段落空行 ``\\n\\n``、单换行 ``\\n`` 全部被压成一个
+        空格。模型本来按 F-001/F-002/F-003 分段写的 high-risk 分析、按行写
+        的 pytest 失败 traceback，最后都变成一行长串。
+
+    新实现：
+        - 先按"空行"切分段落（``\\n\\s*\\n``），保留段落级换行。
+        - 段落内部把所有连续的空格/Tab/单换行折叠成一个空格，去掉行首尾空白。
+        - 最后用两个换行 ``\\n\\n`` 重新拼回去，得到干净的多段 Markdown。
+        - 全空字符串才走 fallback。
+    """
+
+    if not text:
+        return fallback
+
+    # 1) 按空行切段。re.split 会把开头/结尾的空段也保留下来，
+    #    所以下面要再筛掉空字符串。
+    paragraphs = re.split(r"\n\s*\n", str(text))
+
+    cleaned_paragraphs: list[str] = []
+    for paragraph in paragraphs:
+        # 2) 段落内部把所有 \n、\t、连续空格压成一个空格。
+        #    str.split() 无参版本会按任何 unicode 空白拆，等价于把段内换行
+        #    也磨平。这里就是想要这种"段内单行"的效果，因为 PR 评论展示
+        #    时段内换行不一定会换行（取决于渲染器），还不如统一不换行。
+        normalized = " ".join(paragraph.split())
+        if normalized:
+            cleaned_paragraphs.append(normalized)
+
+    if not cleaned_paragraphs:
+        return fallback
+
+    # 3) 段间用空行隔开。Markdown / GitHub 都把 \n\n 当成"新段落"。
+    return "\n\n".join(cleaned_paragraphs)
 
 
 def _line_location(finding: Finding) -> str:
@@ -1491,3 +1528,119 @@ def combine_bilingual_report(*, english_report: str, chinese_report: str) -> str
         "## 中文报告\n\n"
         f"{chinese_report.strip() or '中文化 Agent 未返回译文。'}\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# 方案 B：PR 评论双语 finding 表格
+# ---------------------------------------------------------------------------
+# 设计目标
+#   1. 表格的"骨架"（severity / verification / location 列）由代码渲染，
+#      永远是确定的字符串，LLM 不参与，避免 markdown 表格被破坏。
+#   2. 只把每条 finding 的 problem / impact / suggestion 三个短文本字段
+#      交给 LLM 翻译，并强制按 finding_id 一一回填，缺失/翻译失败时回退
+#      到英文原文，保证表格不会出现空格子。
+#   3. 整批 finding 一次调用模型，省 token 也保证术语一致。
+# ---------------------------------------------------------------------------
+
+
+def _finding_id_to_english_cell(finding: Finding) -> dict[str, str]:
+    """提取一条 finding 在 PR 评论表格中需要翻译的英文单元格内容。
+
+    放到独立函数里有两个目的：
+      * 给 ``finding_cells_localizer_agent`` 拼 prompt 用，保证只暴露
+        必要字段（不会把 evidence、reproduction_hint 等多余信息送进去）。
+      * 给 ``build_pr_comment`` 在中文翻译缺失时做"英文回退"用，保证
+        中文表格永远有内容。
+    """
+
+    return {
+        "finding_id": finding.finding_id,
+        "problem": _short_text(finding.problem),
+        "impact": _short_text(finding.impact),
+        "suggestion": _short_text(finding.suggestion),
+    }
+
+
+def finding_cells_localizer_agent(
+    *,
+    findings: list[Finding],
+    config: ProjectConfig,
+) -> dict[str, LocalizedFindingCell]:
+    """把每条 Finding 的 problem/impact/suggestion 翻译成中文短句。
+
+    返回值用 ``dict[finding_id, LocalizedFindingCell]`` 形式，方便 PR
+    评论渲染时按 finding_id 直接索引。这样：
+      * 调用方不需要做线性查找；
+      * 翻译缺失某条 finding 时，可以立刻用英文回退而不打乱表格行序。
+
+    错误处理策略
+        所有异常路径都返回空字典，让调用方走"英文回退"：
+          - mock 模式：模型不可用，给一个固定中文模板做演示。
+          - 没有配置 report_localizer 角色：跟整篇报告翻译走同一规则。
+          - ModelCallError / 解析失败：吞掉异常，PR 评论显示英文。
+        这条规则跟 report_localizer_agent 一致——任何翻译错误都不应让
+        整个 CI 工作流挂掉，否则会把 PR 检查变成"中文化失败 == 全部失败"。
+    """
+
+    if not findings:
+        return {}
+
+    if config.mock_llm:
+        # mock 模式：给一个机械翻译，方便本地 demo / 单元测试。
+        # 这里的中文不是高质量翻译，只是为了让 PR 评论里中文表格可见。
+        return {
+            finding.finding_id: LocalizedFindingCell(
+                finding_id=finding.finding_id,
+                problem_zh=f"[Mock 中文] {_short_text(finding.problem)}",
+                impact_zh=f"[Mock 中文] {_short_text(finding.impact)}",
+                suggestion_zh=f"[Mock 中文] {_short_text(finding.suggestion)}",
+            )
+            for finding in findings
+        }
+
+    settings = config.model_config.get("report_localizer")
+    if settings is None:
+        # 没配 localizer，就让 PR 评论中文表格自动回退到英文。
+        return {}
+
+    # 只暴露 finding_id + 三个待翻译字段，避免把上下文全塞进 prompt。
+    payload = [_finding_id_to_english_cell(finding) for finding in findings]
+
+    try:
+        result = call_model_json(
+            settings,
+            [
+                (
+                    "system",
+                    (
+                        "You are CodeCross Finding Cells Localizer. Translate "
+                        "every finding's `problem`, `impact`, and `suggestion` "
+                        "into Simplified Chinese. Keep code identifiers, file "
+                        "paths, finding IDs, severity labels, and option "
+                        "values unchanged. Each translation MUST stay on a "
+                        "single line (no line breaks, no markdown lists) so "
+                        "it fits into a markdown table cell. Return JSON that "
+                        "preserves every input finding_id verbatim."
+                    ),
+                ),
+                (
+                    "user",
+                    (
+                        "Findings to translate (JSON array):\n\n"
+                        f"{_json(payload)}\n\n"
+                        f"{json_schema_instruction(LocalizedFindingCells)}"
+                    ),
+                ),
+            ],
+            LocalizedFindingCells,
+        )
+    except ModelCallError:
+        return {}
+
+    # 把 list 转成 dict，并且过滤掉 finding_id 为空或不在原 findings 里的脏数据。
+    valid_ids = {finding.finding_id for finding in findings}
+    indexed: dict[str, LocalizedFindingCell] = {}
+    for cell in result.cells:
+        if cell.finding_id in valid_ids and cell.finding_id not in indexed:
+            indexed[cell.finding_id] = cell
+    return indexed

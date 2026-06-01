@@ -18,6 +18,7 @@ from .agents import (
     context_retriever_agent,
     coverage_gap_agent,
     evaluator_agent,
+    finding_cells_localizer_agent,
     high_risk_review_agent,
     planner_agent,
     report_localizer_agent,
@@ -50,6 +51,7 @@ from .schemas import (
     Finding,
     FindingVerification,
     HighRiskReviewReport,
+    LocalizedFindingCell,
     ReviewPlan,
     ReviewerResult,
     TargetedReview,
@@ -108,6 +110,10 @@ class CodeCrossState(TypedDict, total=False):
     final_report_en: str
     final_report_zh: str
     final_report: str
+    # 方案 B：PR 评论的双语 finding 表格用的"按 finding 翻译的中文短文本"。
+    # key 是 Finding.finding_id，value 是中文 problem/impact/suggestion。
+    # 翻译失败 / mock / 没配 localizer 时这里就是 {}，PR 评论会自动回退到英文。
+    localized_finding_cells: dict[str, LocalizedFindingCell]
 
 
 def _summary_from_state(state: CodeCrossState, stop_reason: str = "") -> BoardSummary:
@@ -461,16 +467,36 @@ def final_report_node(state: CodeCrossState) -> dict[str, str]:
     return {"final_report_en": report, "final_report": report}
 
 
-def report_localizer_node(state: CodeCrossState) -> dict[str, str]:
-    """Graph 节点：把英文最终报告翻译成中文并合并成双语产物。"""
+def report_localizer_node(state: CodeCrossState) -> dict[str, Any]:
+    """Graph 节点：把英文最终报告翻译成中文并合并成双语产物。
+
+    方案 B 之后这个节点除了产出整篇中文 Markdown，还要给 PR 评论的双语
+    finding 表格准备"按 finding 翻译的短文本"。两份产物用同一个 LLM
+    角色（report_localizer），但走两次独立调用：
+        1. report_localizer_agent：翻译整篇 final report Markdown，给
+           "中文报告"段使用。
+        2. finding_cells_localizer_agent：只翻译每条 finding 的
+           problem/impact/suggestion 三个短字段，给 PR 评论的中文表格使用。
+    分两次调用而不是合并成一次的好处：
+        - 表格的 cell 翻译有严格 schema（dict[finding_id, ...]），可以
+          被代码直接消费；和整篇 Markdown 翻译这种"自由文本"分开，错误
+          路径互不影响。
+        - 任意一边翻译失败，另一边不受影响：整篇报告翻译失败只影响
+          "中文报告"段；cell 翻译失败只让 PR 评论中文表格回退到英文。
+    """
 
     english_report = state.get("final_report_en") or state.get("final_report", "")
     chinese_report = report_localizer_agent(
         final_report=english_report,
         config=state["config"],
     )
+    localized_cells = finding_cells_localizer_agent(
+        findings=state.get("findings", []),
+        config=state["config"],
+    )
     return {
         "final_report_zh": chinese_report,
+        "localized_finding_cells": localized_cells,
         "final_report": combine_bilingual_report(
             english_report=english_report,
             chinese_report=chinese_report,
