@@ -4,11 +4,11 @@
 反复给出 high/critical 评分形成‘修-审-修-审’循环。这里覆盖三种关键路径：
 
 1. 纯自指 diff + 已被证据支持的 high finding -> 强制降级到 medium，
-   needs_high_risk_review=False，reasoning/recommended_action 出现中文降级说明。
+   needs_high_risk_review=False，reasoning/recommended_action 出现英文降级说明。
 2. 混合 diff（同时改了业务代码）-> 不降级，按原规则裁决。
 3. 空 changed_files（planner 失败兜底）-> 不降级，行为与历史一致。
 
-最终报告渲染必须在自指场景下追加中文 ‘自指降级说明’ 提示。
+最终报告渲染必须在自指场景下追加英文 self-reference note。
 """
 
 from __future__ import annotations
@@ -90,9 +90,9 @@ def test_evaluator_downgrades_high_to_medium_on_self_reference():
 
     assert report.risk_level == "medium"
     assert report.needs_high_risk_review is False
-    assert "自指" in report.reasoning
-    assert "原始判断理由" in report.reasoning
-    assert "自指" in report.recommended_action
+    assert "self-referential" in report.reasoning
+    assert "Original reasoning" in report.reasoning
+    assert "self-reference rule" in report.recommended_action
 
 
 def test_evaluator_keeps_high_when_diff_is_not_self_reference():
@@ -109,7 +109,7 @@ def test_evaluator_keeps_high_when_diff_is_not_self_reference():
 
     assert report.risk_level == "high"
     assert report.needs_high_risk_review is True
-    assert "自指" not in report.reasoning
+    assert "self-referential" not in report.reasoning
 
 
 def test_evaluator_without_review_plan_behaves_like_before():
@@ -157,16 +157,20 @@ def test_final_report_appends_self_reference_notice():
         high_risk_review=None,
     )
 
-    assert "自指降级说明" in report
-    assert "CodeCross 自身的集成入口" in report
-    assert "## 结论摘要" in report
+    assert "Self-reference note" in report
+    assert "CodeCross integration entrypoints" in report
+    assert "## Executive Summary" in report
 
 
 def test_final_report_omits_self_reference_notice_for_normal_pr():
     finding = _make_high_finding(file_path="src/server/api/routes.py")
     board = _make_high_supported_board(finding.finding_id)
     plan = ReviewPlan(changed_files=[finding.file_path])
-    evaluator = EvaluatorReport(risk_level="high", confidence="high", reasoning="高风险 finding 已被测试证据支持。")
+    evaluator = EvaluatorReport(
+        risk_level="high",
+        confidence="high",
+        reasoning="A high-severity finding is supported by test evidence.",
+    )
 
     report = agents.render_final_report(
         review_plan=plan,
@@ -179,4 +183,4 @@ def test_final_report_omits_self_reference_notice_for_normal_pr():
         high_risk_review=None,
     )
 
-    assert "自指降级说明" not in report
+    assert "Self-reference note" not in report

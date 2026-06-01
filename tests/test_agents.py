@@ -176,8 +176,8 @@ def test_mock_test_author_adds_normal_path_control_case():
     assert "test_safe_divide_normal_division_returns_quotient" in names
 
 
-def test_final_report_localizes_and_deduplicates_findings():
-    """Final report should polish raw reviewer output without a separate model node."""
+def test_final_report_renders_english_and_deduplicates_findings():
+    """Final report stays English; the new localizer agent owns Chinese output."""
 
     first = Finding(
         finding_id="finding_path_1",
@@ -250,23 +250,19 @@ def test_final_report_localizes_and_deduplicates_findings():
         ),
     )
 
-    assert "CodeCross 最终审查报告" in report
-    assert "严重风险" in report
-    assert "暂缓合并，先修复高风险问题" in report
-    assert "路径穿越风险" in report
-    assert "已合并" in report
+    assert "CodeCross Final Review Report" in report
+    assert "Risk level: `critical`" in report
+    assert "Block merge until fixed." in report
+    assert "Path traversal vulnerability" in report
+    assert "similar findings merged" in report
     assert "path.resolve" in report
-    assert "优先验证高严重度问题" in report
-    assert "高风险二次确认已完成" in report
-    assert "证据看板" in report
-    assert "Path traversal vulnerability" not in report
-    assert "Review Board" not in report
-    assert "checkout_codecross step removed" not in report
-    assert "Block merge until fixed" not in report
-    assert "A critical finding has supporting evidence" not in report
-    assert "Reviewer identified a blocking issue" not in report
-    assert "High risk review confirms" not in report
-    assert "Tests and reviewers indicate" not in report
+    assert "high severity findings first" in report
+    assert "High risk review confirms" in report
+    assert "Review Board" in report
+    assert "checkout_codecross step removed" in report
+    assert "A critical finding has supporting evidence" in report
+    assert "Reviewer identified a blocking issue" in report
+    assert "Tests and reviewers indicate" in report
 
 
 def test_infer_target_language_covers_known_extensions():
@@ -345,16 +341,13 @@ def test_normalize_test_batch_preserves_explicit_target_language():
     assert batch.test_cases[0].target_language == "python"
 
 
-def test_reporting_labels_include_cross_verification_statuses():
-    """The PR comment shows ``verification_text(status)``; without these labels the
-    UI silently falls back to the raw status (``cross_supported``), which made the
-    LLM-cross-verification path indistinguishable from pytest in production. Lock
-    the four cross_* statuses so we never regress that fix.
-    """
+def test_report_localizer_mock_returns_chinese_section():
+    """Mock runs still expose the new final-report localizer node output."""
 
-    from codecross import reporting
+    localized = agents.report_localizer_agent(
+        final_report="# CodeCross Final Review Report\n\nEnglish body.",
+        config=load_project_config(mock_llm=True),
+    )
 
-    assert reporting.verification_text("cross_supported") == "模型交叉验证支持"
-    assert reporting.verification_text("cross_refuted") == "模型交叉验证反驳"
-    assert reporting.verification_text("cross_inconclusive") == "模型交叉验证证据不足"
-    assert reporting.verification_text("needs_human_review") == "需人工裁定"
+    assert "CodeCross 最终审查报告（中文）" in localized
+    assert "Mock 模式未调用中文化模型" in localized

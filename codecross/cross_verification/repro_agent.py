@@ -83,8 +83,7 @@ def _strength_from_status(status: str) -> EvidenceStrength:
 def _truncate(text: str, limit: int) -> str:
     """轻量截断，防止 prompt 被超长上下文撑爆。
 
-    这里没有动 reporting.py 的 ``shorten``（用户明确要求别改），
-    只在 prompt 构造场景做最小够用的截断。
+    只在 prompt 构造场景做最小够用的截断，避免影响最终报告渲染。
     """
 
     if len(text) <= limit:

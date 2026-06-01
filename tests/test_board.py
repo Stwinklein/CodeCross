@@ -130,8 +130,8 @@ def test_board_stops_when_round_has_no_verification_progress():
     assert reason == "no_verification_progress"
 
 
-def test_board_markdown_is_localized():
-    """最终报告里的 Board 看板应使用中文标签。"""
+def test_board_markdown_is_english_source_report():
+    """The source final report is English before the localizer agent translates it."""
 
     summary = BoardSummary(
         reviewer_count=2,
@@ -147,8 +147,7 @@ def test_board_markdown_is_localized():
 
     markdown = render_board_markdown(summary)
 
-    assert "## 证据看板" in markdown
-    assert "审查器数量：2" in markdown
-    assert "停止原因：验证队列已清空" in markdown
-    assert "Review Board" not in markdown
-    assert "Reviewers" not in markdown
+    assert "## Review Board" in markdown
+    assert "Reviewers: 2" in markdown
+    assert "Stop reason: verification queue empty" in markdown
+    assert "证据看板" not in markdown

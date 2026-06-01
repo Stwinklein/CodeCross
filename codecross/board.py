@@ -31,25 +31,25 @@ from .schemas import (
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 VERIFICATION_STATUS_LABELS = {
-    "supported": "已被证据支持",
-    "refuted": "已被测试反驳",
-    "unverified": "尚未验证",
-    "inconclusive": "证据不足",
-    "not_testable": "无法自动测试",
+    "supported": "supported by evidence",
+    "refuted": "refuted by tests",
+    "unverified": "unverified",
+    "inconclusive": "inconclusive",
+    "not_testable": "not automatically testable",
     # Issue #2：模型交叉验证产生的 verification 状态。中文标签和 pytest 路径
     # 区分开，让 PR 评论一眼能看出“这条结论由谁背书”。
-    "cross_supported": "模型交叉支持",
-    "cross_refuted": "模型交叉反驳",
-    "cross_inconclusive": "模型交叉证据不足",
-    "needs_human_review": "需人工裁定",
+    "cross_supported": "LLM cross-check supported",
+    "cross_refuted": "LLM cross-check refuted",
+    "cross_inconclusive": "LLM cross-check inconclusive",
+    "needs_human_review": "needs human review",
 }
 
 STOP_REASON_LABELS = {
-    "not stopped": "未提前停止",
-    "verification_queue_empty": "验证队列已清空",
-    "max_verification_rounds_reached": "达到最大验证轮次",
-    "no_verification_progress": "本轮验证没有新增进展",
-    "verification_queue_has_unresolved_targets": "仍有待验证目标",
+    "not stopped": "not stopped",
+    "verification_queue_empty": "verification queue empty",
+    "max_verification_rounds_reached": "maximum verification rounds reached",
+    "no_verification_progress": "no verification progress in this round",
+    "verification_queue_has_unresolved_targets": "verification queue still has unresolved targets",
 }
 
 
@@ -237,7 +237,7 @@ def _result_to_evidence(result: TestResult) -> EvidenceItem:
     """把 executor 的 TestResult 映射成 Board EvidenceItem。"""
 
     # Issue #2：LLM 交叉验证结果走专门的 evidence_type，
-    # 这样 reporting / evaluator 可以用 evidence_type 直接区分两条证据线。
+    # 这样 report rendering / evaluator 可以用 evidence_type 直接区分两条证据线。
     if result.evidence_kind == "llm_cross_verification":
         payload = result.cross_payload
         # status -> 证据强度。这里再经手一次，保持 Board 内部不依赖
@@ -570,29 +570,29 @@ def should_continue_verification(
 
 
 def render_board_markdown(summary: BoardSummary) -> str:
-    """把 BoardSummary 渲染成最终报告中的 Markdown 段落。"""
+    """Render BoardSummary as the English final-report board section."""
 
     status_counts: dict[str, int] = defaultdict(int)
     for verification in summary.finding_verifications.values():
         status_counts[verification.status] += 1
     status_text = ", ".join(
-        f"{VERIFICATION_STATUS_LABELS.get(key, key)}：{value}"
+        f"{VERIFICATION_STATUS_LABELS.get(key, key)}: {value}"
         for key, value in sorted(status_counts.items())
     )
     stop_reason = STOP_REASON_LABELS.get(
         summary.stop_reason or "not stopped",
-        summary.stop_reason or "未提前停止",
+        summary.stop_reason or "not stopped",
     )
     return (
-        "## 证据看板\n\n"
-        f"- 审查器数量：{summary.reviewer_count}\n"
-        f"- 问题数量：{summary.finding_count}\n"
-        f"- 测试意图：{summary.test_intent_count}\n"
-        f"- 测试用例：{summary.test_case_count}\n"
-        f"- 验证轮次：{summary.test_round_count}\n"
-        f"- 通过测试：{summary.passed_count}\n"
-        f"- 失败测试：{summary.failed_count}\n"
-        f"- 错误/阻塞测试：{summary.error_count}\n"
-        f"- 验证状态：{status_text or '无'}\n"
-        f"- 停止原因：{stop_reason}\n"
+        "## Review Board\n\n"
+        f"- Reviewers: {summary.reviewer_count}\n"
+        f"- Findings: {summary.finding_count}\n"
+        f"- Test intents: {summary.test_intent_count}\n"
+        f"- Test cases: {summary.test_case_count}\n"
+        f"- Verification rounds: {summary.test_round_count}\n"
+        f"- Passed tests: {summary.passed_count}\n"
+        f"- Failed tests: {summary.failed_count}\n"
+        f"- Error/blocked tests: {summary.error_count}\n"
+        f"- Verification status: {status_text or 'none'}\n"
+        f"- Stop reason: {stop_reason}\n"
     )

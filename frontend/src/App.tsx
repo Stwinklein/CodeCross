@@ -361,11 +361,20 @@ const pipelineNodes: PipelineNode[] = [
   },
   {
     id: "final_report",
-    label: "Final Report",
-    friendly: "生成最终报告",
-    detail: "输出 Markdown 报告和结构化快照。",
+    label: "EN Report",
+    friendly: "生成英文最终报告",
+    detail: "输出 canonical English Markdown 报告和结构化快照。",
     model: "local renderer",
-    x: 85,
+    x: 80,
+    y: 86,
+  },
+  {
+    id: "report_localizer",
+    label: "Localizer",
+    friendly: "翻译中文报告",
+    detail: "调用 Report Localizer Agent，把英文最终报告翻译成中文并合并双语产物。",
+    model: "后端配置读取中",
+    x: 93,
     y: 86,
   },
 ];
@@ -2131,6 +2140,7 @@ function modelForPipelineNode(node: PipelineNode, config: ApiRuntimeConfig | nul
     coverage_gap: "coverage_gap_agent",
     evaluator: "evaluator",
     high_risk_review: "high_risk_reviewer",
+    report_localizer: "report_localizer",
   };
   const role = roleByNode[node.id];
   return role ? config.role_models[role] || node.model : node.model;

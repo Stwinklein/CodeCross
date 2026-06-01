@@ -14,11 +14,13 @@ from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from .agents import (
+    combine_bilingual_report,
     context_retriever_agent,
     coverage_gap_agent,
     evaluator_agent,
     high_risk_review_agent,
     planner_agent,
+    report_localizer_agent,
     render_final_report,
     reviewer_agent,
     targeted_reviewer_agent,
@@ -103,6 +105,8 @@ class CodeCrossState(TypedDict, total=False):
     stop_reason: str
     evaluator_report: EvaluatorReport
     high_risk_review: HighRiskReviewReport | None
+    final_report_en: str
+    final_report_zh: str
     final_report: str
 
 
@@ -444,17 +448,33 @@ def high_risk_review_node(state: CodeCrossState) -> dict[str, HighRiskReviewRepo
 
 
 def final_report_node(state: CodeCrossState) -> dict[str, str]:
-    """Graph 节点：生成 Markdown 最终报告。"""
+    """Graph 节点：生成 canonical English Markdown 最终报告。"""
 
+    report = render_final_report(
+        review_plan=state["review_plan"],
+        code_context=state.get("code_context"),
+        reviewer_results=state.get("reviewer_results", []),
+        board_summary=state["board_summary"],
+        evaluator_report=state["evaluator_report"],
+        high_risk_review=state.get("high_risk_review"),
+    )
+    return {"final_report_en": report, "final_report": report}
+
+
+def report_localizer_node(state: CodeCrossState) -> dict[str, str]:
+    """Graph 节点：把英文最终报告翻译成中文并合并成双语产物。"""
+
+    english_report = state.get("final_report_en") or state.get("final_report", "")
+    chinese_report = report_localizer_agent(
+        final_report=english_report,
+        config=state["config"],
+    )
     return {
-        "final_report": render_final_report(
-            review_plan=state["review_plan"],
-            code_context=state.get("code_context"),
-            reviewer_results=state.get("reviewer_results", []),
-            board_summary=state["board_summary"],
-            evaluator_report=state["evaluator_report"],
-            high_risk_review=state.get("high_risk_review"),
-        )
+        "final_report_zh": chinese_report,
+        "final_report": combine_bilingual_report(
+            english_report=english_report,
+            chinese_report=chinese_report,
+        ),
     }
 
 
@@ -485,6 +505,7 @@ def build_graph(config: ProjectConfig):
     graph.add_node("evaluator", evaluator_node)
     graph.add_node("high_risk_review", high_risk_review_node)
     graph.add_node("final_report", final_report_node)
+    graph.add_node("report_localizer", report_localizer_node)
 
     # 主干流程：Planner -> Context Retriever -> 多 reviewer 并行 -> Board -> Evidence Loop -> Evaluator。
     graph.add_edge(START, "planner")
@@ -527,7 +548,8 @@ def build_graph(config: ProjectConfig):
         {"high_risk_review": "high_risk_review", "final_report": "final_report"},
     )
     graph.add_edge("high_risk_review", "final_report")
-    graph.add_edge("final_report", END)
+    graph.add_edge("final_report", "report_localizer")
+    graph.add_edge("report_localizer", END)
     return graph.compile()
 
 
@@ -540,6 +562,7 @@ def _infer_progress_node(state: CodeCrossState) -> str:
     """
 
     checkpoints = [
+        ("final_report_zh", "report_localizer"),
         ("final_report", "final_report"),
         ("high_risk_review", "high_risk_review"),
         ("evaluator_report", "evaluator"),
@@ -625,5 +648,5 @@ def run_workflow(
 
     _check_cancel(should_cancel)
     if on_event:
-        on_event("workflow_finished", {"node": "final_report", "message": "Workflow finished."})
+        on_event("workflow_finished", {"node": "report_localizer", "message": "Workflow finished."})
     return latest_state

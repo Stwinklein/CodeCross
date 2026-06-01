@@ -20,27 +20,12 @@ from typing import Any
 from pydantic import BaseModel
 
 from .config import ModelSettings, ProjectConfig, load_project_config
-from .reporting import (
-    SEVERITY_LABELS,
-    build_default_report_presentation,
-    confidence_text,
-    context_counts,
-    merge_advice,
-    needs_chinese_fallback,
-    risk_text,
-    shorten,
-    stop_reason_text,
-    table_cell,
-    test_summary,
-    verification_counts,
-)
-from .schemas import Finding, ReportFindingRow, ReviewerResult
+from .schemas import ReviewerResult
 from .workflow import CodeCrossState, run_workflow
 
 
 COMMENT_MARKER = "<!-- codecross-pr-review -->"
 DEFAULT_MAX_COMMENT_CHARS = 60_000
-DEFAULT_SUMMARY_FINDING_LIMIT = 10
 
 
 @dataclass(slots=True)
@@ -127,98 +112,37 @@ def _workflow_url() -> str:
 
 
 def _model_label_from_state(state: CodeCrossState) -> str:
-    """汇总 reviewer 使用的模型名称，但绝不展示 API key 或 base URL。"""
+    """Summarize reviewer model names without exposing API keys or base URLs."""
 
     reviewers: list[ReviewerResult] = state.get("reviewer_results", [])
     labels = [result.model for result in reviewers if result.model]
-    return ", ".join(dict.fromkeys(labels)) or "未记录"
-
-
-def _render_report_findings_table(rows_to_render: list[ReportFindingRow], limit: int) -> str:
-    """Render final-report finding rows into a compact Markdown table."""
-
-    rows_to_render = [
-        row
-        for row in rows_to_render
-        if "反驳" not in (row.verification_status or "")
-    ]
-    if not rows_to_render:
-        return "当前没有剩余已被证据支持或待人工确认的重点问题；已被测试反驳的问题保留在完整 CI 产物中。"
-
-    rows = [
-        "| 严重级别 | 验证状态 | 位置 | 问题 | 建议 |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    for row in rows_to_render[:limit]:
-        problem = row.problem
-        if len(row.finding_ids) > 1:
-            problem += f"（已合并 {len(row.finding_ids)} 条相近发现）"
-        rows.append(
-            "| "
-            f"{SEVERITY_LABELS.get(row.severity, row.severity)} | "
-            f"{row.verification_status or '未进入验证'} | "
-            f"`{row.location or '未知位置'}` | "
-            f"{table_cell(problem)} | "
-            f"{table_cell(row.suggestion)} |"
-        )
-
-    remaining = len(rows_to_render) - limit
-    if remaining > 0:
-        rows.append(f"\n_还有 {remaining} 条问题在完整 CI 产物里。_")
-    return "\n".join(rows)
-
-
-def _looks_like_code_symbol(value: str) -> bool:
-    """Keep identifiers visible, but hide English prose from the PR summary."""
-
-    value = (value or "").strip()
-    if not value:
-        return False
-    return " " not in value and len(value) <= 80
-
-
-def _display_changed_symbols(symbols: list[str] | None) -> str:
-    """Render changed symbols without turning planner English prose into UI copy."""
-
-    if not symbols:
-        return "无"
-    visible = [
-        symbol
-        for symbol in symbols[:16]
-        if not needs_chinese_fallback(symbol) or _looks_like_code_symbol(symbol)
-    ]
-    hidden = len(symbols) - len(visible)
-    if visible:
-        rendered = ", ".join(visible)
-        if hidden > 0:
-            rendered += f"，另有 {hidden} 条变更说明见 CI 产物"
-        return rendered
-    return f"{len(symbols)} 条变更说明，完整列表见 CI 产物"
+    return ", ".join(dict.fromkeys(labels)) or "not recorded"
 
 
 def _reviewer_error_block(state: CodeCrossState) -> str:
-    """展示模型调用或传输错误，避免 CI 评论看起来像“正常无问题”。"""
+    """Show model/transport errors without leaking raw provider details."""
 
     lines: list[str] = []
     for result in state.get("reviewer_results", []):
         if result.errors:
             lines.append(
-                f"- `{result.reviewer_name}`: 审查器返回结果无法解析，"
-                "本次已降级使用其他审查结果；完整错误见 CI 产物。"
+                f"- `{result.reviewer_name}` returned errors; the workflow kept "
+                "other available review evidence. See the JSON artifact for details."
             )
     if not lines:
         return ""
-    return "\n\n**审查器错误**\n" + "\n".join(lines)
+    return "\n\n### Reviewer Errors\n\n" + "\n".join(lines)
 
 
 def truncate_comment(markdown: str, max_chars: int) -> str:
-    """限制评论长度，同时保留用于更新旧评论的 HTML marker。"""
+    """Limit comment length while keeping the HTML marker used for updates."""
 
     if len(markdown) <= max_chars:
         return markdown
     suffix = (
         "\n\n---\n"
-        "_评论内容已截断，以避免超过 GitHub 评论长度限制。完整结果请查看 CI 产物。_\n"
+        "_Comment truncated to stay under GitHub's comment length limit. "
+        "See the CI artifact for the complete result._\n"
     )
     budget = max(max_chars - len(suffix), len(COMMENT_MARKER) + 32)
     return markdown[:budget].rstrip() + suffix
@@ -231,98 +155,65 @@ def build_pr_comment(
     mock_llm: bool = False,
     max_chars: int = DEFAULT_MAX_COMMENT_CHARS,
 ) -> str:
-    """生成会被贴到 PR Conversation 的中文 Markdown 报告。
+    """Build the PR Conversation comment with English and Chinese reports.
 
-    第一行的 HTML marker 不能删：``github_pr_comment.py`` 会用它找到上一条
-    CodeCross 评论并原地更新。这样同一个 PR 多次 push 时，只会保留一条最新报告，
-    不会在对话区刷出一长串重复评论。
-
-    报告结构刻意分成四层：
-    1. “结论看板”让 reviewer、作者和面试官都能一眼看到风险与合并建议。
-    2. “结论摘要”把表格压缩成人能直接转述的中文结论。
-    3. “变更与上下文”说明模型到底看到了哪些文件、符号和检索上下文。
-    4. “重点问题”只列最重要 findings，完整细节仍保存在 JSON artifact。
+    Keep the first-line marker: ``github_pr_comment.py`` uses it to update the
+    existing CodeCross comment instead of creating a new one on every push.
     """
 
     metadata = metadata or PullRequestMetadata()
     if not metadata.workflow_url:
         metadata.workflow_url = _workflow_url()
 
-    plan = state.get("review_plan")
-    context = state.get("code_context")
-    board = state.get("board_summary")
     evaluator = state.get("evaluator_report")
-    findings: list[Finding] = state.get("findings", [])
-    presentation = build_default_report_presentation(
-        findings=findings,
-        board_summary=board,
-        evaluator_report=evaluator,
-        high_risk_review=state.get("high_risk_review"),
-    )
-
     risk_level = evaluator.risk_level if evaluator else "unknown"
     confidence = evaluator.confidence if evaluator else "medium"
-    changed_files = ", ".join(plan.changed_files[:12]) if plan else "无"
-    if plan and len(plan.changed_files) > 12:
-        changed_files += f", ... (+{len(plan.changed_files) - 12})"
-    changed_symbols = _display_changed_symbols(plan.changed_symbols if plan else None)
+    mode_label = "mock/demo mode" if mock_llm else "real model mode"
+    english_report = (
+        str(state.get("final_report_en") or "").strip()
+        or str(state.get("final_report") or "").strip()
+        or "# CodeCross Final Review Report\n\nWorkflow did not produce a final report."
+    )
+    chinese_report = (
+        str(state.get("final_report_zh") or "").strip()
+        or "中文化 Agent 没有返回译文；请查看英文报告。"
+    )
 
-    mode_label = "演示/Mock 模式" if mock_llm else "真实模型模式"
     lines = [
         COMMENT_MARKER,
-        "## CodeCross PR 审查报告",
+        "## CodeCross PR Review",
         "",
-        "### 结论看板",
+        "### Run Summary",
         "",
-        "| 项目 | 结果 |",
+        "| Field | Value |",
         "| --- | --- |",
-        f"| 风险等级 | **{risk_text(risk_level)}** |",
-        f"| 合并建议 | **{merge_advice(risk_level)}** |",
-        f"| 置信度 | {confidence_text(confidence)} |",
-        f"| 运行模式 | {mode_label} |",
-        f"| 审查模型 | {_model_label_from_state(state)} |",
+        f"| Risk level | `{risk_level}` |",
+        f"| Confidence | `{confidence}` |",
+        f"| Run mode | {mode_label} |",
+        f"| Reviewer models | {_model_label_from_state(state)} |",
     ]
     if metadata.head_sha:
-        lines.append(f"| 提交 | `{metadata.head_sha[:12]}` |")
+        lines.append(f"| Commit | `{metadata.head_sha[:12]}` |")
     if metadata.workflow_url:
-        lines.append(f"| CI 运行 | [打开 Actions 运行]({metadata.workflow_url}) |")
-    if board:
-        lines.extend(
-            [
-                f"| 问题数 | {board.finding_count} |",
-                f"| 测试结果 | {test_summary(board)} |",
-                f"| 验证状态 | {verification_counts(board)} |",
-                f"| 验证停止原因 | {stop_reason_text(board.stop_reason)} |",
-            ]
-        )
+        lines.append(f"| CI run | [Open Actions run]({metadata.workflow_url}) |")
 
     lines.extend(
         [
             "",
-            "### 结论摘要",
+            "### English Report",
             "",
-            presentation.conclusion_summary,
+            english_report,
             "",
-            "### 建议动作",
+            "---",
             "",
-            presentation.recommended_action,
+            "### 中文报告",
             "",
-            "### 变更与上下文",
-            "",
-            f"- 变更文件：{changed_files or '无'}",
-            f"- 变更符号：{changed_symbols or '无'}",
-            f"- 检索到的上下文：{context_counts(context)}",
-            "",
-            "### 重点问题",
-            "",
-            _render_report_findings_table(
-                presentation.finding_rows,
-                DEFAULT_SUMMARY_FINDING_LIMIT,
-            ),
+            chinese_report,
             _reviewer_error_block(state),
             "",
             "---",
-            "_由 CodeCross 生成。API Key 和 Base URL 只从 CI 环境变量读取，不会写入本评论。_",
+            "_Generated by CodeCross. API keys and Base URLs are read from CI/runtime "
+            "environment variables and are never written into this comment._",
         ]
     )
     return truncate_comment("\n".join(lines), max_chars)
@@ -345,6 +236,7 @@ def _required_settings_for_ci(config: ProjectConfig) -> list[ModelSettings]:
         "test_result_analyzer",
         "coverage_gap_agent",
         "evaluator",
+        "report_localizer",
     }
     settings = [
         setting

@@ -144,6 +144,21 @@ def load_project_config(
 
     deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
     anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+    report_localizer_provider = os.getenv(
+        "CODECROSS_REPORT_LOCALIZER_PROVIDER", "deepseek"
+    ).strip().lower()
+    default_localizer_model = (
+        deepseek_model if report_localizer_provider == "deepseek" else anthropic_model
+    )
+    report_localizer_model = os.getenv("CODECROSS_REPORT_LOCALIZER_MODEL", default_localizer_model)
+    report_localizer_api_key_env = os.getenv(
+        "CODECROSS_REPORT_LOCALIZER_API_KEY_ENV",
+        "DEEPSEEK_API_KEY" if report_localizer_provider == "deepseek" else "ANTHROPIC_API_KEY",
+    )
+    report_localizer_base_url_env = os.getenv(
+        "CODECROSS_REPORT_LOCALIZER_BASE_URL_ENV",
+        "DEEPSEEK_BASE_URL" if report_localizer_provider == "deepseek" else "ANTHROPIC_BASE_URL",
+    )
 
     deepseek = ModelSettings(
         role="deepseek_reviewer",
@@ -239,6 +254,18 @@ def load_project_config(
         api_key_env="ANTHROPIC_API_KEY",
         base_url_env="ANTHROPIC_BASE_URL",
     )
+    # The final report is now written in English first, then localized by a
+    # dedicated agent. It defaults to the existing DeepSeek channel, while these
+    # CODECROSS_REPORT_LOCALIZER_* env vars let CI or the API route it elsewhere.
+    report_localizer = ModelSettings(
+        role="report_localizer",
+        provider=report_localizer_provider,
+        model=report_localizer_model,
+        temperature=0.0,
+        max_tokens=8000,
+        api_key_env=report_localizer_api_key_env,
+        base_url_env=report_localizer_base_url_env,
+    )
     # Issue #2：LLM 交叉验证 ReproAgent 的角色配置。
     # 默认走 Anthropic：reviewer 已经是 DeepSeek + Anthropic 的组合，
     # ReproAgent 选 Anthropic 是为了在 fallback 路径上仍然保持“跨家族”独立性，
@@ -266,6 +293,7 @@ def load_project_config(
             "targeted_reviewer": targeted,
             "evaluator": evaluator,
             "high_risk_reviewer": high_risk,
+            "report_localizer": report_localizer,
             "repro_agent": repro_agent,
         },
         mock_llm=mock_llm,

@@ -19,15 +19,6 @@ from .board import render_board_markdown
 from .config import ModelSettings, ProjectConfig
 from .context import retrieve_code_context
 from .llm import ModelCallError, call_model_json, json_schema_instruction
-from .reporting import (
-    build_default_report_presentation,
-    category_text,
-    confidence_text,
-    merge_advice,
-    needs_chinese_fallback,
-    polish_report_terms,
-    risk_text,
-)
 from .schemas import (
     BoardSummary,
     CodeContext,
@@ -35,6 +26,7 @@ from .schemas import (
     Finding,
     HighRiskReviewReport,
     LineRange,
+    LocalizedReport,
     ReviewPlan,
     ReviewerResult,
     TargetedReview,
@@ -1031,11 +1023,11 @@ SELF_REFERENCE_PATH_EXACT: frozenset[str] = frozenset(
     {".github/workflows/codecross-pr-review.yml"}
 )
 SELF_REFERENCE_NOTE = (
-    "本次 PR 仅修改 CodeCross 自身的集成入口或运行载体代码（例如 "
-    ".github/workflows/codecross-pr-review.yml 或 .codecross-runner/）。"
-    "为避免 reviewer 在自指语境下持续给出 high/critical 评分形成"
-    "‘修-审-修-审’循环，evaluator 已按自指规则降级到 medium，"
-    "并跳过高风险二次复核。原始 finding 仍保留在结构化 JSON 产物中，请人工复核。"
+    "This PR only changes CodeCross integration entrypoints or runner files "
+    "(for example .github/workflows/codecross-pr-review.yml or .codecross-runner/). "
+    "To avoid a self-referential review loop, the evaluator downgraded blocking "
+    "risk to medium and skipped the high-risk follow-up. Original findings remain "
+    "available in the structured JSON artifact for human review."
 )
 
 
@@ -1112,43 +1104,43 @@ def evaluator_agent(
     # 下面是设计文档里的 rule-first 风险裁决：测试证据优先于模型话术。
     if reviewer_failures > len(reviewer_results) / 2:
         risk_level = "unknown"
-        reasoning = "超过半数 reviewer 执行失败。"
+        reasoning = "More than half of the reviewers failed."
     elif any(finding.severity == "critical" for finding in supported):
         risk_level = "critical"
-        reasoning = "严重 finding 已被测试证据支持。"
+        reasoning = "A critical finding is supported by test evidence."
     elif any(finding.severity == "high" for finding in supported):
         risk_level = "high"
-        reasoning = "高风险 finding 已被测试证据支持。"
+        reasoning = "A high-severity finding is supported by test evidence."
     elif any(finding.severity == "critical" for finding in unresolved_high):
         risk_level = "high"
-        reasoning = "严重 finding 在证据验证后仍未解决。"
+        reasoning = "A critical finding remains unresolved after evidence verification."
     elif unresolved_high:
         risk_level = "medium"
-        reasoning = "仍有高风险 finding 处于证据不足状态。"
+        reasoning = "At least one high-severity finding still has insufficient evidence."
     elif any(finding.severity in {"high", "critical"} for finding in cross_supported):
         # Issue #2：cross 路径只能给到 medium，因为模型推理证据不能等同于真实测试。
         risk_level = "medium"
-        reasoning = "高风险 finding 仅由模型交叉验证支持，建议人工再核。"
+        reasoning = "A high-severity finding is only supported by LLM cross-verification; human review is recommended."
     elif any(finding.severity == "medium" for finding in supported):
         risk_level = "medium"
-        reasoning = "中风险 finding 已被证据支持。"
+        reasoning = "A medium-severity finding is supported by evidence."
     elif any(finding.severity == "medium" for finding in cross_supported):
         risk_level = "medium"
-        reasoning = "中风险 finding 由模型交叉验证支持。"
+        reasoning = "A medium-severity finding is supported by LLM cross-verification."
     elif board_summary.error_count:
         risk_level = "medium"
-        reasoning = "验证执行器报告了错误或被阻断的测试。"
+        reasoning = "The verification executor reported errors or blocked tests."
     else:
         risk_level = "low"
-        reasoning = "没有剩余已被证据支持的中高风险 finding。"
+        reasoning = "No remaining medium-or-higher findings are supported by evidence."
 
     self_reference = is_self_referential_review(review_plan)
     if self_reference and risk_level in {"high", "critical"}:
         # 仅降级阻断级评分，medium/low/unknown 维持原判
         risk_level = "medium"
-        reasoning = f"{SELF_REFERENCE_NOTE} 原始判断理由：{reasoning}"
+        reasoning = f"{SELF_REFERENCE_NOTE} Original reasoning: {reasoning}"
     elif self_reference:
-        reasoning = f"{SELF_REFERENCE_NOTE} 原始判断理由：{reasoning}"
+        reasoning = f"{SELF_REFERENCE_NOTE} Original reasoning: {reasoning}"
 
     top_findings = [
         finding.finding_id
@@ -1161,18 +1153,22 @@ def evaluator_agent(
     needs_high_risk_review = risk_level in {"high", "critical"} and not self_reference
     if self_reference:
         recommended_action = (
-            "本次为 CodeCross 自身集成审查，已按自指规则降级。"
-            "请人工核对结构化 JSON 产物中的原始 finding 后决定是否合并。"
+            "This is a CodeCross self-integration review and was downgraded by "
+            "the self-reference rule. Review the original findings in the JSON "
+            "artifact before deciding whether to merge."
         )
     elif risk_level in {"high", "critical"}:
-        recommended_action = "阻断合并，或要求修复后再合并。"
+        recommended_action = "Block the merge until the supported findings are fixed."
     else:
-        recommended_action = "先人工确认未解决事项，再按项目策略决定是否合并。"
+        recommended_action = "Review any unresolved items, then merge according to project policy."
     return EvaluatorReport(
         risk_level=risk_level,  # type: ignore[arg-type]
         confidence="high" if risk_level in {"low", "high", "critical"} else "medium",
         top_findings=top_findings,
-        evidence_summary=f"失败测试 {board_summary.failed_count} 个，通过测试 {board_summary.passed_count} 个。",
+        evidence_summary=(
+            f"{board_summary.failed_count} failed tests, "
+            f"{board_summary.passed_count} passed tests."
+        ),
         failed_tests_summary="\n".join(result.failure_summary for result in board_summary.failed_tests),
         coverage_gaps=board_summary.coverage_gaps,
         verification_summary=render_board_markdown(board_summary),
@@ -1198,8 +1194,8 @@ def high_risk_review_agent(
     blocking = evaluator_report.top_findings
     if config.mock_llm:
         return HighRiskReviewReport(
-            analysis="高风险二次确认认为：已有证据支持的 finding 应阻断本次变更。",
-            recommended_action="先修复阻断级 finding，然后重新运行 CodeCross。",
+            analysis="High-risk follow-up confirms that evidence-supported findings should block this change.",
+            recommended_action="Fix the blocking findings, then rerun CodeCross.",
             blocking_findings=blocking,
         )
 
@@ -1223,79 +1219,106 @@ def high_risk_review_agent(
         )  # type: ignore[return-value]
     except ModelCallError:
         return HighRiskReviewReport(
-            analysis="高风险 reviewer 调用失败；沿用规则优先的 Evaluator 结果。",
+            analysis="High-risk reviewer call failed; keeping the rule-first evaluator result.",
             recommended_action=evaluator_report.recommended_action,
             blocking_findings=blocking,
         )
 
 
-_FINAL_REPORT_TERM_LABELS = {
-    "boundary conditions": "边界条件",
-    "command injection": "命令注入",
-    "edge cases and exception paths": "覆盖边界条件和异常路径",
-    "exception flow": "异常流程",
-    "high severity findings first": "优先验证高严重度问题",
-    "logic correctness": "逻辑正确性",
-    "pytest evidence for reproducible issues": "用 pytest 固化可复现证据",
-    "regression risk": "回归风险",
-    "secret handling": "密钥处理",
+RISK_LABELS = {
+    "critical": "critical",
+    "high": "high",
+    "medium": "medium",
+    "low": "low",
+    "unknown": "unknown",
 }
 
 
-def _localized_report_text(text: str, fallback: str) -> str:
+def _join_or_none(items: list[str], *, limit: int | None = None) -> str:
+    cleaned = [" ".join((item or "").split()) for item in items]
+    cleaned = [item for item in cleaned if item]
+    if limit is not None and len(cleaned) > limit:
+        visible = cleaned[:limit]
+        visible.append(f"... (+{len(cleaned) - limit} more)")
+        return ", ".join(visible)
+    return ", ".join(cleaned) if cleaned else "none"
+
+
+def _short_text(text: str, fallback: str = "not provided") -> str:
     cleaned = " ".join((text or "").split())
-    if not cleaned:
-        return fallback
-
-    mapped = _FINAL_REPORT_TERM_LABELS.get(cleaned.lower())
-    if mapped:
-        return mapped
-    if needs_chinese_fallback(cleaned):
-        return fallback
-    return polish_report_terms(cleaned)
+    return cleaned or fallback
 
 
-def _localized_report_list(items: list[str], *, empty: str = "无") -> str:
-    visible: list[str] = []
-    hidden_count = 0
-    for item in items:
-        cleaned = " ".join((item or "").split())
-        if not cleaned:
+def _line_location(finding: Finding) -> str:
+    start = finding.line_range.start
+    if start is None:
+        return finding.file_path or "unknown location"
+    end = finding.line_range.end
+    if end is None or end == start:
+        return f"{finding.file_path}:{start}"
+    return f"{finding.file_path}:{start}-{end}"
+
+
+def _merge_advice(risk_level: str) -> str:
+    if risk_level in {"critical", "high"}:
+        return "Block the merge until the supported findings are fixed."
+    if risk_level == "medium":
+        return "Review and fix or explicitly accept the remaining risk before merging."
+    if risk_level == "low":
+        return "Merge is acceptable after normal human review."
+    return "Risk is unknown; inspect CI logs and the full workflow artifact before merging."
+
+
+def _finding_sort_key(finding: Finding) -> tuple[int, str, int]:
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    return (
+        severity_order.get(finding.severity, 9),
+        finding.file_path,
+        finding.line_range.start or 0,
+    )
+
+
+def _dedupe_key(finding: Finding) -> tuple[str, str, int | None, int | None, str]:
+    return (
+        finding.severity,
+        finding.file_path,
+        finding.line_range.start,
+        finding.line_range.end,
+        finding.category.lower(),
+    )
+
+
+def _render_key_findings(
+    findings: list[Finding],
+    board_summary: BoardSummary,
+    *,
+    limit: int = 10,
+) -> str:
+    lines: list[str] = []
+    seen: dict[tuple[str, str, int | None, int | None, str], list[Finding]] = {}
+    for finding in sorted(findings, key=_finding_sort_key):
+        verification = board_summary.finding_verifications.get(finding.finding_id)
+        if verification and verification.status in {"refuted", "cross_refuted"}:
             continue
+        seen.setdefault(_dedupe_key(finding), []).append(finding)
 
-        mapped = _FINAL_REPORT_TERM_LABELS.get(cleaned.lower())
-        if not mapped:
-            mapped = category_text(cleaned)
-            if mapped == "代码" and needs_chinese_fallback(cleaned):
-                hidden_count += 1
-                continue
-            if mapped == cleaned:
-                mapped = polish_report_terms(cleaned)
-        if mapped not in visible:
-            visible.append(mapped)
+    for grouped in list(seen.values())[:limit]:
+        finding = grouped[0]
+        verification = board_summary.finding_verifications.get(finding.finding_id)
+        status = verification.status if verification else "unverified"
+        duplicate_note = f" ({len(grouped)} similar findings merged)" if len(grouped) > 1 else ""
+        lines.append(
+            f"- [`{finding.severity}` / `{status}`] `{_line_location(finding)}`: "
+            f"{_short_text(finding.problem)}{duplicate_note}\n"
+            f"  - Impact: {_short_text(finding.impact)}\n"
+            f"  - Recommendation: {_short_text(finding.suggestion)}"
+        )
 
-    if hidden_count:
-        visible.append(f"{hidden_count} 项原始计划已保留在结构化 JSON 产物中")
-    return ", ".join(visible) if visible else empty
-
-
-def _display_changed_symbols(items: list[str]) -> str:
-    cleaned_items = [" ".join((item or "").split()) for item in items]
-    cleaned_items = [item for item in cleaned_items if item]
-    if not cleaned_items:
-        return "无"
-
-    visible: list[str] = []
-    prose_count = 0
-    for item in cleaned_items:
-        if " " in item and needs_chinese_fallback(item):
-            prose_count += 1
-            continue
-        visible.append(polish_report_terms(item))
-
-    if prose_count:
-        visible.append(f"{prose_count} 条变更说明已保留在结构化 JSON 产物中")
-    return ", ".join(visible) if visible else f"{len(cleaned_items)} 条变更说明已保留在结构化 JSON 产物中"
+    if not lines:
+        return "No remaining key findings."
+    if len(seen) > limit:
+        lines.append(f"- ... {len(seen) - limit} more findings are available in the JSON artifact.")
+    return "\n".join(lines)
 
 
 def render_final_report(
@@ -1307,126 +1330,164 @@ def render_final_report(
     high_risk_review: HighRiskReviewReport | None,
     code_context: CodeContext | None = None,
 ) -> str:
-    """把 workflow 的关键结果汇总成 Markdown 报告。"""
+    """Render the workflow result as the canonical English Markdown report."""
 
-    # 最终报告比 PR 评论更完整，但仍然只放摘要：每个 reviewer 的完整 finding、
-    # test_intent 和错误对象已经在结构化 state 中，前端或 JSON artifact 可以展开。
+    # Keep the source report in English. A dedicated Report Localizer Agent runs
+    # after this node and produces the Chinese translation from this canonical
+    # artifact, which prevents two independent localization systems from drifting.
     reviewer_sections: list[str] = []
     for result in reviewer_results:
-        reviewer_notes = _localized_report_text(
+        reviewer_notes = _short_text(
             result.reviewer_notes,
-            "审查器原始备注已保留在结构化 JSON 产物中。",
+            "Reviewer notes are available in the structured JSON artifact.",
         )
         reviewer_sections.append(
             "\n".join(
                 [
                     f"### {result.reviewer_name}",
-                    f"- 模型：{result.model}",
-                    f"- 发现数：{len(result.findings)}",
-                    f"- 测试意图：{len(result.test_intents)}",
-                    f"- 错误数：{len(result.errors)}",
+                    f"- Model: {result.model}",
+                    f"- Findings: {len(result.findings)}",
+                    f"- Test intents: {len(result.test_intents)}",
+                    f"- Errors: {len(result.errors)}",
                     reviewer_notes,
                 ]
             )
         )
 
-    # 高风险二次确认是可选节点：只有 evaluator 认为 high/critical 时才会出现。
-    # 因此这里先准备空字符串，避免低风险 PR 报告里出现空标题。
     high_risk_section = ""
     if high_risk_review:
-        blocking = ", ".join(high_risk_review.blocking_findings) or "无"
-        high_risk_analysis = _localized_report_text(
+        blocking = ", ".join(high_risk_review.blocking_findings) or "none"
+        high_risk_analysis = _short_text(
             high_risk_review.analysis,
-            "高风险二次确认已完成；原始复核细节已保留在结构化 JSON 产物中，最终结论以本报告的结论摘要和重点问题为准。",
+            "High-risk follow-up completed; see the structured JSON artifact for details.",
         )
-        high_risk_action = _localized_report_text(
+        high_risk_action = _short_text(
             high_risk_review.recommended_action,
-            merge_advice(evaluator_report.risk_level),
+            _merge_advice(evaluator_report.risk_level),
         )
         high_risk_section = (
-            "\n## 高风险二次确认\n\n"
+            "\n## High-Risk Follow-Up\n\n"
             f"{high_risk_analysis}\n\n"
-            f"建议动作：{high_risk_action}\n\n"
-            f"阻断级问题：{blocking}\n"
+            f"Recommended action: {high_risk_action}\n\n"
+            f"Blocking findings: {blocking}\n"
         )
 
     context_section = ""
     if code_context:
-        # 报告里只放摘要，不展开所有代码片段，避免 Markdown 过长。
-        # 真正完整的 snippets 仍保留在 JSON state 里，适合前端抽屉或调试工具展示。
         context_section = (
-            "\n## 代码上下文\n\n"
-            f"- 变更文件：{', '.join(code_context.changed_files) or '无'}\n"
-            f"- 变更符号：{_display_changed_symbols(code_context.changed_symbols)}\n"
-            f"- 上下文片段数：{len(code_context.snippets)}\n"
-            f"- 未能读取的文件：{', '.join(code_context.missing_files) or '无'}\n\n"
+            "\n## Code Context\n\n"
+            f"- Changed files: {_join_or_none(code_context.changed_files)}\n"
+            f"- Changed symbols: {_join_or_none(code_context.changed_symbols)}\n"
+            f"- Context snippets: {len(code_context.snippets)}\n"
+            f"- Missing files: {_join_or_none(code_context.missing_files)}\n\n"
         )
 
-    presentation = build_default_report_presentation(
-        findings=[
-            finding
-            for result in reviewer_results
-            for finding in result.findings
-        ],
-        board_summary=board_summary,
-        evaluator_report=evaluator_report,
-        high_risk_review=high_risk_review,
-    )
-    finding_lines = []
-    for row in presentation.finding_rows[:10]:
-        problem = row.problem
-        if len(row.finding_ids) > 1:
-            problem += f"（已合并 {len(row.finding_ids)} 条相近发现）"
-        finding_lines.append(
-            f"- [{row.verification_status or '未进入验证'}] "
-            f"{row.location or '未知位置'}：{problem} 建议：{row.suggestion}"
-        )
-    presentation_section = (
-        "\n## 结论摘要\n\n"
-        f"{presentation.conclusion_summary}\n\n"
-        f"建议动作：{presentation.recommended_action or '无'}\n\n"
+    findings = [finding for result in reviewer_results for finding in result.findings]
+    summary_section = (
+        "\n## Executive Summary\n\n"
+        f"Risk is **{RISK_LABELS.get(evaluator_report.risk_level, evaluator_report.risk_level)}** "
+        f"with **{evaluator_report.confidence}** confidence. "
+        f"{_short_text(evaluator_report.reasoning)}\n\n"
+        f"Recommended action: {_short_text(evaluator_report.recommended_action, _merge_advice(evaluator_report.risk_level))}\n\n"
         + (
-            f"> 自指降级说明：{SELF_REFERENCE_NOTE}\n\n"
+            f"> Self-reference note: {SELF_REFERENCE_NOTE}\n\n"
             if is_self_referential_review(review_plan)
             else ""
         )
-        + "## 重点问题\n\n"
-        + ("\n".join(finding_lines) if finding_lines else "无剩余重点问题。")
+        + "## Key Findings\n\n"
+        + _render_key_findings(findings, board_summary)
         + "\n\n"
     )
-    risk_reasoning = _localized_report_text(
-        evaluator_report.reasoning,
-        "风险判断来自已收集的测试结果、验证状态和审查器发现。",
-    )
-    evidence_summary = _localized_report_text(
+    evidence_summary = _short_text(
         evaluator_report.evidence_summary,
-        "完整证据摘要已保留在结构化 JSON 产物中；报告上方已汇总测试和验证状态。",
+        "Evidence details are available in the structured JSON artifact.",
     )
-    failed_tests_summary = _localized_report_text(
+    failed_tests_summary = _short_text(
         evaluator_report.failed_tests_summary,
-        "没有失败测试详情。",
+        "No failed-test details were reported.",
     )
 
     return (
-        "# CodeCross 最终审查报告\n\n"
-        f"## 风险结论\n\n"
-        f"- 风险等级：{risk_text(evaluator_report.risk_level)}\n"
-        f"- 置信度：{confidence_text(evaluator_report.confidence)}\n"
-        f"- 判断理由：{risk_reasoning}\n"
-        f"- 建议动作：{presentation.recommended_action or merge_advice(evaluator_report.risk_level)}\n\n"
-        "## 审查计划\n\n"
-        f"- 变更文件：{', '.join(review_plan.changed_files) or '无'}\n"
-        f"- 变更符号：{_display_changed_symbols(review_plan.changed_symbols)}\n"
-        f"- 风险方向：{_localized_report_list(review_plan.risk_areas)}\n"
-        f"- 测试重点：{_localized_report_list(review_plan.testing_focus)}\n\n"
+        "# CodeCross Final Review Report\n\n"
+        f"## Risk Conclusion\n\n"
+        f"- Risk level: `{evaluator_report.risk_level}`\n"
+        f"- Confidence: `{evaluator_report.confidence}`\n"
+        f"- Reasoning: {_short_text(evaluator_report.reasoning)}\n"
+        f"- Recommended action: {_short_text(evaluator_report.recommended_action, _merge_advice(evaluator_report.risk_level))}\n\n"
+        "## Review Plan\n\n"
+        f"- Changed files: {_join_or_none(review_plan.changed_files)}\n"
+        f"- Changed symbols: {_join_or_none(review_plan.changed_symbols)}\n"
+        f"- Risk areas: {_join_or_none(review_plan.risk_areas)}\n"
+        f"- Testing focus: {_join_or_none(review_plan.testing_focus)}\n\n"
         + context_section
-        + presentation_section
-        + "## Reviewer 输出\n\n"
+        + summary_section
+        + "## Reviewer Outputs\n\n"
         + "\n\n".join(reviewer_sections)
         + "\n\n"
         + render_board_markdown(board_summary)
-        + "\n## 证据摘要\n\n"
+        + "\n## Evidence Summary\n\n"
         f"{evidence_summary}\n\n"
         f"{failed_tests_summary}\n"
         + high_risk_section
+    )
+
+
+def report_localizer_agent(*, final_report: str, config: ProjectConfig) -> str:
+    """Translate the canonical English final report into Simplified Chinese."""
+
+    if config.mock_llm:
+        return (
+            "# CodeCross 最终审查报告（中文）\n\n"
+            "> Mock 模式未调用中文化模型；真实模式会由 Report Localizer Agent "
+            "把英文最终报告完整翻译为中文。\n\n"
+            + final_report
+        )
+
+    settings = config.model_config.get("report_localizer")
+    if settings is None:
+        return (
+            "# 中文报告生成失败\n\n"
+            "未配置 `report_localizer` 模型角色；请检查 ProjectConfig.model_config。\n"
+        )
+
+    try:
+        result = call_model_json(
+            settings,
+            [
+                (
+                    "system",
+                    (
+                        "You are CodeCross Report Localizer. Translate the given "
+                        "English Markdown report into Simplified Chinese. Preserve "
+                        "Markdown structure, code blocks, file paths, identifiers, "
+                        "finding IDs, enum values, and risk labels. Do not add new "
+                        "findings or change the recommendation. Return only JSON."
+                    ),
+                ),
+                (
+                    "user",
+                    f"English report:\n\n{final_report}\n\n{json_schema_instruction(LocalizedReport)}",
+                ),
+            ],
+            LocalizedReport,
+        )
+        markdown = result.markdown.strip()
+        return markdown or "# 中文报告生成失败\n\nReport Localizer Agent returned an empty translation."
+    except ModelCallError as exc:
+        return (
+            "# 中文报告生成失败\n\n"
+            f"Report Localizer Agent 调用失败：{exc}\n"
+        )
+
+
+def combine_bilingual_report(*, english_report: str, chinese_report: str) -> str:
+    """Combine English and Chinese reports while keeping each version intact."""
+
+    return (
+        "# CodeCross Bilingual Final Review Report\n\n"
+        "## English Report\n\n"
+        f"{english_report.strip()}\n\n"
+        "---\n\n"
+        "## 中文报告\n\n"
+        f"{chinese_report.strip() or '中文化 Agent 未返回译文。'}\n"
     )

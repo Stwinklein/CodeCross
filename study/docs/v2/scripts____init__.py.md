@@ -1,0 +1,7 @@
+# `scripts/__init__.py` 解析
+
+## 文件作用
+脚本包入口，让 `scripts.github_pr_comment` 可作为 console script 导入。
+
+- 源码行数：1
+- 这个文件没有定义函数或类，主要承担包初始化、导出或导入标记职责。
