@@ -17,6 +17,7 @@ import ast
 from pathlib import Path
 
 from .config import RunnerConfig
+from .cross_verification.triggers import detect_cross_verification_trigger
 from .schemas import (
     CodeContext,
     CrossVerificationPayload,
@@ -622,6 +623,35 @@ def execute_test_cases(
             )
             continue
         if test_case.test_type not in {"pytest", "static_check"}:
+            # Issue #2：在放弃之前，检查是否应该走 LLM 交叉验证 fallback。
+            # 典型场景：mock 生成器对 JS 文件产出 test_type=manual，但 target_language
+            # 已被 _normalize_test_batch 填为 javascript → trigger 命中 unsupported_language。
+            trigger = detect_cross_verification_trigger(
+                test_case, runner_config
+            )
+            if trigger and runner_config.cross_verification_enabled:
+                test_case.cross_verification_trigger = trigger
+                if cross_used >= cross_budget:
+                    results.append(
+                        _skipped_result(
+                            test_case,
+                            round_index,
+                            f"Cross verification budget exhausted ({cross_budget}/round).",
+                            error_type="cross_verification_budget_exceeded",
+                        )
+                    )
+                    continue
+                cross_used += 1
+                results.append(
+                    _run_cross_verification(
+                        test_case,
+                        round_index=round_index,
+                        finding_map=finding_map,
+                        code_context=code_context,
+                        project_config=project_config,
+                    )
+                )
+                continue
             results.append(
                 _skipped_result(
                     test_case,
