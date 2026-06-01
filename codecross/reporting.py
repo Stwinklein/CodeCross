@@ -338,22 +338,37 @@ def _common_finding_translation(finding: Finding) -> tuple[str, str] | None:
 
 
 def localized_finding_text(finding: Finding) -> tuple[str, str]:
-    """Return Chinese problem/suggestion text for a finding."""
+    """Return Chinese problem/suggestion text for a finding.
+
+    Strategy:
+    1. Try COMMON_FINDING_TRANSLATIONS for known patterns.
+    2. For the *problem* column, use the Chinese category-based template to keep
+       the report visually consistent (Chinese headings).
+    3. For the *suggestion* column, preserve the model's specific English advice
+       when available — a concrete English suggestion is far more actionable than
+       a generic Chinese template.
+    """
 
     translation = _common_finding_translation(finding)
     if translation:
         return translation
 
+    # --- problem: always Chinese template for consistency ---
     problem = (
         _fallback_problem(finding)
         if not finding.problem or needs_chinese_fallback(finding.problem)
         else polish_report_terms(finding.problem)
     )
-    suggestion = (
-        _fallback_suggestion(finding)
-        if not finding.suggestion or needs_chinese_fallback(finding.suggestion)
-        else polish_report_terms(finding.suggestion)
-    )
+
+    # --- suggestion: preserve specific model advice even if English ---
+    if not finding.suggestion:
+        suggestion = _fallback_suggestion(finding)
+    elif needs_chinese_fallback(finding.suggestion):
+        # English suggestion — keep the model's specific advice
+        suggestion = finding.suggestion
+    else:
+        suggestion = polish_report_terms(finding.suggestion)
+
     return problem, suggestion
 
 

@@ -224,7 +224,8 @@ def test_default_presentation_keeps_unknown_findings_actionable_without_placehol
     assert "未能稳定中文化" not in row.problem
     assert "security-env-injection" not in row.problem
     assert "Shell command interpolates" not in row.problem
-    assert "Keep values in environment variables" not in row.suggestion
+    # English suggestion is now preserved (specific advice > generic template)
+    assert "Keep values in environment variables" in row.suggestion
     assert "安全校验风险需要人工复核" in row.problem
     assert "原始修复建议" not in row.suggestion
     assert "fs.readFileSync" not in row.problem
