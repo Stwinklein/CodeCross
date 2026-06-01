@@ -13,6 +13,7 @@ can be tested independently.
 import argparse
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from pydantic import BaseModel
 from .config import ModelSettings, ProjectConfig, load_project_config
 from .schemas import (
     BoardSummary,
+    EvaluatorReport,
     Finding,
     LocalizedFindingCell,
     ReviewerResult,
@@ -32,14 +34,13 @@ from .workflow import CodeCrossState, run_workflow
 COMMENT_MARKER = "<!-- codecross-pr-review -->"
 DEFAULT_MAX_COMMENT_CHARS = 60_000
 
-# 方案 B：PR 评论双语 finding 表格的最大行数。
-# 选 10 是因为 Markdown 表格在 GitHub Web 端 / 邮件通知里再多就不好读了；
-# 真正需要看完整 finding 的人可以下载 JSON artifact。和 _render_key_findings
-# 默认值保持一致，避免英文 final report 和 PR 评论的"前 10 条"不是同一组。
+# 方案 C：PR 评论顶层可快速扫读的 finding 数量上限。
+# 选 10 是因为新版评论会同时渲染一览表、Why 卡片和修复清单；超过这个数量
+# 顶层就会重新变得拥挤。完整报告和 JSON artifact 仍然保留全部细节。
 DEFAULT_PR_TABLE_FINDING_LIMIT = 10
 
 # 严重等级显示用的中英映射。这里把它放到模块级常量是为了让 PR 评论的
-# 中文/英文表格永远输出同一组标签——不让 LLM 翻译这些枚举值，避免
+# 中文/英文段永远输出同一组标签——不让 LLM 翻译这些枚举值，避免
 # "严重 / Critical / 严重风险"这种不一致出现在不同 PR 上。
 SEVERITY_LABELS_EN: dict[str, str] = {
     "critical": "Critical",
@@ -53,15 +54,41 @@ SEVERITY_LABELS_ZH: dict[str, str] = {
     "medium": "中",
     "low": "低",
 }
+SEVERITY_BADGES_EN: dict[str, str] = {
+    "critical": "🔴 C",
+    "high": "🔴 H",
+    "medium": "🟠 M",
+    "low": "🟡 L",
+}
+SEVERITY_BADGES_ZH: dict[str, str] = {
+    "critical": "🔴 严重",
+    "high": "🔴 高",
+    "medium": "🟠 中",
+    "low": "🟡 低",
+}
 SEVERITY_ORDER: dict[str, int] = {
     "critical": 0,
     "high": 1,
     "medium": 2,
     "low": 3,
 }
+RISK_ICONS: dict[str, str] = {
+    "critical": "🔴",
+    "high": "🔴",
+    "medium": "🟠",
+    "low": "🟢",
+    "unknown": "⚪",
+}
+VERDICT_ACTIONS: dict[str, str] = {
+    "critical": "Block merge",
+    "high": "Block merge",
+    "medium": "Comment",
+    "low": "Approve",
+    "unknown": "Comment",
+}
 
 # 验证状态显示标签。和 schemas.VerificationStatus 字面量保持一一对应。
-# 命名口径：英文表格用 schema 原值，中文表格用人类可读的短词。
+# 命名口径：英文 Why 卡片用 schema 原值，中文 Why 卡片用人类可读的短词。
 VERIFICATION_LABELS_EN: dict[str, str] = {
     "unverified": "unverified",
     "supported": "supported",
@@ -207,20 +234,17 @@ def truncate_comment(markdown: str, max_chars: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 方案 B：PR 评论双语 finding 表格渲染
+# 方案 C：PR 评论"答题式"版面渲染
 # ---------------------------------------------------------------------------
 # 设计原则（核心，看代码先看这段注释）：
-#   1. **结构由代码决定**：表格的列数、表头分隔线、每一行的列数都由本地
-#      代码生成，永远不会被 LLM 误改。LLM 只负责翻译三个长字段的中文版
-#      （problem/impact/suggestion）。
-#   2. **中英行序严格对齐**：先做一次"去重 + 排序 + 截断"，得到一份
-#      ``finding_rows``，英文表格、中文表格都从这一份遍历。这样可以保证
-#      "中文表格第 3 行" == "英文表格第 3 行"，方便用户对照。
-#   3. **缺翻译就回退英文**：如果 finding cells localizer 没翻、或某条
-#      finding 缺翻译，中文表格会直接显示英文短文本。这条 row 仍然存在，
-#      不会留空，避免出现"中文表格少一行"的诡异情况。
-#   4. **单元格防御性转义**：finding 文本里如果出现 ``|``、``\n``，会破坏
-#      Markdown 表格语法，所以单独有一个 _escape_table_cell 处理。
+#   1. **结构由代码决定**：顶层 verdict、三列表格、Why 卡片、task list 和
+#      details 折叠块都由本地代码生成，LLM 只提供 finding 文案和中文译文。
+#   2. **中英段完整镜像**：先做一次"去重 + 排序 + 截断"，得到同一份
+#      ``table_findings``；英文段、中文段都从这份列表渲染，顺序严格一致。
+#   3. **缺翻译就回退英文**：如果 localized_finding_cells 没有某条 finding，
+#      中文段仍然显示英文原文，保证不会出现空卡片、空清单或中英行数错位。
+#   4. **表格单元格防御性转义**：finding 文本里如果出现 ``|``、``\n``，
+#      会破坏 Markdown 表格语法，所以单独有一个 _escape_table_cell 处理。
 # ---------------------------------------------------------------------------
 
 
@@ -274,6 +298,65 @@ def _escape_table_cell(text: str) -> str:
     )
 
 
+def _truncate_inline(text: str, *, max_chars: int = 180) -> str:
+    """把一段单行文本限制到适合 PR 评论顶层展示的长度。"""
+
+    cleaned = _flatten_table_text(text)
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3].rstrip() + "..."
+
+
+def _first_sentence(text: str, fallback: str = "—", *, max_chars: int = 180) -> str:
+    """抽取一条 finding 文案的第一句，给 verdict/checklist/card 标题使用。
+
+    这里不做 NLP，只做保守的标点切分。原因是 PR 评论渲染必须稳定、
+    可测试，而不能依赖模型再总结一次。
+    """
+
+    cleaned = _flatten_table_text(text, fallback)
+    cleaned = re.sub(r"^(?:[-*]\s+|\[[ xX]\]\s+)", "", cleaned).strip()
+    match = re.match(r"(.+?[.!?。！？])(?:\s|$)", cleaned)
+    if match and len(match.group(1).strip()) >= 8:
+        cleaned = match.group(1).strip()
+    return _truncate_inline(cleaned, max_chars=max_chars)
+
+
+def _finding_title(finding: Finding, problem_text: str | None = None) -> str:
+    """从 problem 字段里提取一段适合放在卡片标题里的短标题。"""
+
+    problem = _flatten_table_text(problem_text or finding.problem)
+    colon_title = re.split(r"[:：]", problem, maxsplit=1)[0].strip()
+    if 4 <= len(colon_title) <= 80 and colon_title != problem:
+        return colon_title
+    return _first_sentence(problem, max_chars=80)
+
+
+def _severity_badge_en(severity: str) -> str:
+    """英文段 severity 的短标签：emoji + 首字母。"""
+
+    return SEVERITY_BADGES_EN.get(severity, severity)
+
+
+def _severity_badge_zh(severity: str) -> str:
+    """中文段 severity 的短标签：emoji + 中文等级。"""
+
+    return SEVERITY_BADGES_ZH.get(severity, severity)
+
+
+def _localized_texts(
+    finding: Finding,
+    localized_cells: dict[str, LocalizedFindingCell],
+) -> tuple[str, str, str]:
+    """读取一条 finding 的中文 problem/impact/suggestion，缺失时回退英文。"""
+
+    cell = localized_cells.get(finding.finding_id)
+    problem = (cell.problem_zh.strip() if cell else "") or finding.problem
+    impact = (cell.impact_zh.strip() if cell else "") or finding.impact
+    suggestion = (cell.suggestion_zh.strip() if cell else "") or finding.suggestion
+    return problem, impact, suggestion
+
+
 def _verification_status_for(finding: Finding, board_summary: BoardSummary) -> str:
     """从 BoardSummary 里查这条 finding 的当前验证状态。"""
 
@@ -287,12 +370,12 @@ def _select_table_findings(
     *,
     limit: int = DEFAULT_PR_TABLE_FINDING_LIMIT,
 ) -> list[Finding]:
-    """挑出 PR 评论双语表格要展示的 finding 子集。
+    """挑出 PR 评论顶层速读区要展示的 finding 子集。
 
     这一步是"准备结构化数据"，**完全不依赖翻译产物**——这样英文/中文
-    表格一定从同一组 finding 出发，行数一致、行序一致。规则：
+    镜像段一定从同一组 finding 出发，行数一致、行序一致。规则：
       1. **过滤**：board 已经把它判为 refuted / cross_refuted 的，不展示
-         （和 _render_key_findings 一致，避免假阳性占据有限的表格行）。
+         （和 _render_key_findings 一致，避免假阳性占据有限的顶层空间）。
       2. **去重**：用 (severity, file, line range, category) 当 key，多个
          reviewer 命中同一处时只显示第一条，后面的并入"similar findings
          merged" 提示（这里 PR 评论简化成只展示第一条，提示放回 final
@@ -330,31 +413,21 @@ def _render_findings_table_en(
     findings: list[Finding],
     board_summary: BoardSummary,
 ) -> str:
-    """渲染英文 finding 表格。
-
-    列设计参考老版 ci.py 的 _render_report_findings_table：
-        | Severity | Verification | Location | Problem | Suggestion |
-    Impact 不放进表格（5 列已经接近 GitHub Web UI 单行可读上限）；它会
-    出现在 final report 的 Key Findings bullet 段，已经够了。
-    """
+    """渲染英文一览表，只放定位问题需要的三列。"""
 
     if not findings:
         return "_No remaining key findings to display._\n"
 
     lines = [
-        "| Severity | Verification | Location | Problem | Suggestion |",
-        "| --- | --- | --- | --- | --- |",
+        "| Sev | Location | Problem |",
+        "| --- | --- | --- |",
     ]
     for finding in findings:
-        severity_label = SEVERITY_LABELS_EN.get(finding.severity, finding.severity)
-        verification = _verification_status_for(finding, board_summary)
-        verification_label = VERIFICATION_LABELS_EN.get(verification, verification)
+        severity_label = _severity_badge_en(finding.severity)
         location = _line_location(finding)
         problem = _escape_table_cell(_flatten_table_text(finding.problem))
-        suggestion = _escape_table_cell(_flatten_table_text(finding.suggestion))
         lines.append(
-            f"| {severity_label} | {verification_label} | "
-            f"`{_escape_table_cell(location)}` | {problem} | {suggestion} |"
+            f"| {severity_label} | `{_escape_table_cell(location)}` | {problem} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -364,12 +437,11 @@ def _render_findings_table_zh(
     board_summary: BoardSummary,
     localized_cells: dict[str, LocalizedFindingCell],
 ) -> str:
-    """渲染中文 finding 表格。
+    """渲染中文一览表，和英文表共享同一组 finding 行序。
 
-    severity / verification / location 都用代码生成的中文标签——这些是
-    枚举类的列，绝不交给 LLM。problem / suggestion 优先取
+    severity / location 都用代码生成的标签。problem 优先取
     ``localized_cells[finding_id]``，缺失则回退到英文原文，这样：
-      * 中文表格永远有内容；
+      * 中文一览表永远有内容；
       * 翻译出错最坏的结果是某些行变成中英混排，而不是空白单元格 / 行数对不齐。
     """
 
@@ -377,28 +449,258 @@ def _render_findings_table_zh(
         return "_暂无需要展示的关键 finding。_\n"
 
     lines = [
-        "| 严重级别 | 验证状态 | 位置 | 问题 | 建议 |",
-        "| --- | --- | --- | --- | --- |",
+        "| 严重 | 位置 | 问题 |",
+        "| --- | --- | --- |",
     ]
     for finding in findings:
-        severity_label = SEVERITY_LABELS_ZH.get(finding.severity, finding.severity)
-        verification = _verification_status_for(finding, board_summary)
-        verification_label = VERIFICATION_LABELS_ZH.get(verification, verification)
+        severity_label = _severity_badge_zh(finding.severity)
         location = _line_location(finding)
 
-        cell = localized_cells.get(finding.finding_id)
-        # 中文文本优先取翻译产物。模型偶尔会返回空字符串，这种也按"翻译缺失"
-        # 处理 → 回退到英文，避免空格子。
-        problem_text = (cell.problem_zh.strip() if cell else "") or finding.problem
-        suggestion_text = (cell.suggestion_zh.strip() if cell else "") or finding.suggestion
-
+        problem_text, _, _ = _localized_texts(finding, localized_cells)
         problem = _escape_table_cell(_flatten_table_text(problem_text))
-        suggestion = _escape_table_cell(_flatten_table_text(suggestion_text))
         lines.append(
-            f"| {severity_label} | {verification_label} | "
-            f"`{_escape_table_cell(location)}` | {problem} | {suggestion} |"
+            f"| {severity_label} | `{_escape_table_cell(location)}` | {problem} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def _display_finding_id(index: int) -> str:
+    """给 PR 评论生成稳定、易引用的展示 ID。"""
+
+    return f"FINDING-{index:03d}"
+
+
+def _render_finding_cards_en(
+    findings: list[Finding],
+    board_summary: BoardSummary,
+) -> str:
+    """渲染英文 Why 卡片：What / Impact / Fix 三段式。"""
+
+    if not findings:
+        return "_No finding cards to display._\n"
+
+    lines: list[str] = []
+    for index, finding in enumerate(findings, start=1):
+        verification = _verification_status_for(finding, board_summary)
+        verification_label = VERIFICATION_LABELS_EN.get(verification, verification)
+        severity = SEVERITY_LABELS_EN.get(finding.severity, finding.severity)
+        lines.extend(
+            [
+                (
+                    f"▸ {_severity_badge_en(finding.severity).split()[0]} "
+                    f"**{_display_finding_id(index)} · {_finding_title(finding)}** "
+                    f"({severity.lower()} · {verification_label})"
+                ),
+                "",
+                f"- **What:** {_first_sentence(finding.problem, max_chars=260)}",
+                f"- **Impact:** {_first_sentence(finding.impact, max_chars=260)}",
+                f"- **Fix:** {_first_sentence(finding.suggestion, max_chars=260)}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_finding_cards_zh(
+    findings: list[Finding],
+    board_summary: BoardSummary,
+    localized_cells: dict[str, LocalizedFindingCell],
+) -> str:
+    """渲染中文 Why 卡片；翻译缺失时逐字段回退英文。"""
+
+    if not findings:
+        return "_暂无 finding 卡片。_\n"
+
+    lines: list[str] = []
+    for index, finding in enumerate(findings, start=1):
+        problem, impact, suggestion = _localized_texts(finding, localized_cells)
+        verification = _verification_status_for(finding, board_summary)
+        verification_label = VERIFICATION_LABELS_ZH.get(verification, verification)
+        severity = SEVERITY_LABELS_ZH.get(finding.severity, finding.severity)
+        lines.extend(
+            [
+                (
+                    f"▸ {_severity_badge_zh(finding.severity).split()[0]} "
+                    f"**{_display_finding_id(index)} · {_finding_title(finding, problem)}**"
+                    f"（{severity} · {verification_label}）"
+                ),
+                "",
+                f"- **问题：** {_first_sentence(problem, max_chars=260)}",
+                f"- **影响：** {_first_sentence(impact, max_chars=260)}",
+                f"- **修复：** {_first_sentence(suggestion, max_chars=260)}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_action_checklist_en(findings: list[Finding]) -> str:
+    """从英文 suggestion 字段提取可勾选的修复清单。"""
+
+    if not findings:
+        return "- [ ] No action items were generated.\n"
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for finding in findings:
+        action = _first_sentence(finding.suggestion, finding.problem, max_chars=180)
+        key = action.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"- [ ] {action}")
+    return "\n".join(lines) + "\n"
+
+
+def _render_action_checklist_zh(
+    findings: list[Finding],
+    localized_cells: dict[str, LocalizedFindingCell],
+) -> str:
+    """从中文 suggestion 字段提取可勾选的修复清单，缺翻译则回退英文。"""
+
+    if not findings:
+        return "- [ ] 暂无生成的修复项。\n"
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for finding in findings:
+        _, _, suggestion = _localized_texts(finding, localized_cells)
+        action = _first_sentence(suggestion, finding.suggestion, max_chars=180)
+        key = action.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"- [ ] {action}")
+    return "\n".join(lines) + "\n"
+
+
+def _test_evidence_phrase(board_summary: BoardSummary | None) -> str:
+    """把 BoardSummary 的测试统计压成 verdict 第二行里的短括号。"""
+
+    if board_summary is None:
+        return ""
+
+    failed = board_summary.failed_count
+    passed = board_summary.passed_count
+    total = failed + passed + board_summary.error_count + board_summary.skipped_count
+    if total <= 0:
+        total = board_summary.test_case_count
+    if total <= 0:
+        return ""
+    return f" ({failed}/{total} tests failed, {passed} passed)"
+
+
+def _verdict_reason(
+    *,
+    evaluator: EvaluatorReport | None,
+    board_summary: BoardSummary | None,
+    findings: list[Finding],
+) -> str:
+    """生成顶部 verdict 的一句话理由。
+
+    优先使用 evaluator.reasoning；没有时从结构化 finding/测试统计推导一条
+    稳定文案，保证异常路径也能给出可读结论。
+    """
+
+    if evaluator and evaluator.reasoning.strip():
+        return _first_sentence(evaluator.reasoning, max_chars=220)
+
+    severe_findings = [
+        finding for finding in findings if finding.severity in {"critical", "high"}
+    ]
+    if severe_findings:
+        supported_statuses = {"supported", "cross_supported"}
+        supported_count = 0
+        if board_summary is not None:
+            supported_count = sum(
+                1
+                for finding in severe_findings
+                if _verification_status_for(finding, board_summary) in supported_statuses
+            )
+        count = supported_count or len(severe_findings)
+        noun = "finding" if count == 1 else "findings"
+        verb = "has" if count == 1 else "have"
+        if supported_count:
+            return (
+                f"{count} high-severity {noun} {verb} reproducible test evidence"
+                f"{_test_evidence_phrase(board_summary)}."
+            )
+        return f"{count} high-severity {noun} {verb} not been cleared for merge."
+
+    if findings:
+        noun = "finding" if len(findings) == 1 else "findings"
+        return f"{len(findings)} {noun} need review before merge."
+
+    if evaluator and evaluator.recommended_action.strip():
+        return _first_sentence(evaluator.recommended_action, max_chars=220)
+    return "No remaining key findings are shown."
+
+
+def _render_verdict_block(
+    *,
+    evaluator: EvaluatorReport | None,
+    board_summary: BoardSummary | None,
+    findings: list[Finding],
+) -> str:
+    """渲染评论顶部的一眼结论 blockquote。"""
+
+    risk_level = evaluator.risk_level if evaluator else "unknown"
+    confidence = evaluator.confidence if evaluator else "medium"
+    action = VERDICT_ACTIONS.get(risk_level, "Comment")
+    icon = RISK_ICONS.get(risk_level, "⚪")
+    reason = _verdict_reason(
+        evaluator=evaluator,
+        board_summary=board_summary,
+        findings=findings,
+    )
+    return (
+        f"> {icon} **{action}** · risk **{risk_level}** · confidence **{confidence}**\n"
+        f"> {reason}\n"
+    )
+
+
+def _render_run_info(
+    *,
+    state: CodeCrossState,
+    metadata: PullRequestMetadata,
+    mode_label: str,
+) -> str:
+    """渲染默认折叠的 CI 元信息，避免干扰顶层阅读。"""
+
+    lines = [
+        "<details>",
+        "<summary>Run info</summary>",
+        "",
+        "| Field | Value |",
+        "| --- | --- |",
+        f"| Run mode | {_escape_table_cell(mode_label)} |",
+        f"| Reviewers | {_escape_table_cell(_model_label_from_state(state))} |",
+    ]
+    if metadata.repository:
+        lines.append(f"| Repository | `{_escape_table_cell(metadata.repository)}` |")
+    if metadata.pr_number is not None:
+        lines.append(f"| Pull request | `#{metadata.pr_number}` |")
+    if metadata.head_sha:
+        lines.append(f"| Commit | `{_escape_table_cell(metadata.head_sha[:12])}` |")
+    if metadata.base_ref or metadata.head_ref:
+        base = metadata.base_ref or "unknown"
+        head = metadata.head_ref or "unknown"
+        lines.append(f"| Branches | `{_escape_table_cell(head)}` → `{_escape_table_cell(base)}` |")
+    if metadata.workflow_url:
+        lines.append(f"| CI run | [Open Actions run]({metadata.workflow_url}) |")
+    lines.extend(["", "</details>"])
+    return "\n".join(lines)
+
+
+def _render_report_details(summary: str, report: str) -> str:
+    """把 workflow 已生成的完整长报告折叠起来，保留深读入口。"""
+
+    return (
+        "<details>\n"
+        f"<summary>{summary}</summary>\n\n"
+        f"{report.strip()}\n\n"
+        "</details>\n"
+    )
 
 
 def build_pr_comment(
@@ -408,20 +710,14 @@ def build_pr_comment(
     mock_llm: bool = False,
     max_chars: int = DEFAULT_MAX_COMMENT_CHARS,
 ) -> str:
-    """Build the PR Conversation comment with English and Chinese reports.
+    """Build the PR Conversation comment with the plan C answer-first layout.
 
     PR 评论的版面（从上到下）：
-        1. ``CodeCross PR Review`` 标题 + Run Summary 元信息表格。
-        2. **方案 B 新增** ``Key Findings`` 段：英文表格 + 中文表格，
-           两份表格行序严格一致；都从结构化 ``Finding`` + ``BoardSummary``
-           渲染，LLM 只负责翻译三个文本字段（problem/impact/suggestion）。
-        3. ``English Report`` ：workflow 渲染好的英文 Markdown 全文。
-        4. ``中文报告``：workflow 翻译好的中文 Markdown 全文。
-        5. Reviewer Errors（如有）+ 法律 footer。
-
-    把 finding 表格放在两份长报告**前面**是有意为之：用户在 GitHub 邮件
-    通知/手机端 review 时往往只看顶部几屏，结构化的双语表格就是给
-    "扫一眼"用的。完整文字版报告留给真正深读的人。
+        1. 顶部 verdict blockquote：该不该合、风险等级、置信度和一句话理由。
+        2. ``Run info`` 折叠块：CI 元数据默认收起，排查时再展开。
+        3. 英文镜像段：三列一览表 → Why 卡片 → Action checklist → 完整报告折叠。
+        4. 中文镜像段：同一批 finding、同一行序，文案优先用 localized cells。
+        5. Reviewer Errors（如有）+ footer。
 
     Keep the first-line marker: ``github_pr_comment.py`` uses it to update the
     existing CodeCross comment instead of creating a new one on every push.
@@ -432,8 +728,6 @@ def build_pr_comment(
         metadata.workflow_url = _workflow_url()
 
     evaluator = state.get("evaluator_report")
-    risk_level = evaluator.risk_level if evaluator else "unknown"
-    confidence = evaluator.confidence if evaluator else "medium"
     mode_label = "mock/demo mode" if mock_llm else "real model mode"
     english_report = (
         str(state.get("final_report_en") or "").strip()
@@ -445,7 +739,7 @@ def build_pr_comment(
         or "中文化 Agent 没有返回译文；请查看英文报告。"
     )
 
-    # 方案 B：从 state 拿结构化数据，渲染双语 finding 表格。
+    # 方案 C：从 state 拿结构化数据，渲染顶层速读区。
     # 注意 ``findings`` 取自 state 而不是从 reviewer_results 重新展平：
     # workflow 里 initial_board_node 已经把所有 reviewer 的 finding 合并到
     # state["findings"] 里了，从那里取等价但更省一次 list comprehension。
@@ -464,73 +758,82 @@ def build_pr_comment(
         else []
     )
 
+    if board_summary is None:
+        english_overview = "_No board summary available; see the JSON artifact._\n"
+        chinese_overview = "_暂无 Board 汇总数据；请查看 JSON artifact。_\n"
+        english_cards = "_No board summary available; see the JSON artifact._\n"
+        chinese_cards = "_暂无 Board 汇总数据；请查看 JSON artifact。_\n"
+    else:
+        english_overview = _render_findings_table_en(table_findings, board_summary)
+        chinese_overview = _render_findings_table_zh(
+            table_findings,
+            board_summary,
+            localized_cells,
+        )
+        english_cards = _render_finding_cards_en(table_findings, board_summary)
+        chinese_cards = _render_finding_cards_zh(
+            table_findings,
+            board_summary,
+            localized_cells,
+        )
+
     lines = [
         COMMENT_MARKER,
         "## CodeCross PR Review",
         "",
-        "### Run Summary",
+        _render_verdict_block(
+            evaluator=evaluator,
+            board_summary=board_summary,
+            findings=table_findings,
+        ).rstrip(),
         "",
-        "| Field | Value |",
-        "| --- | --- |",
-        f"| Risk level | `{risk_level}` |",
-        f"| Confidence | `{confidence}` |",
-        f"| Run mode | {mode_label} |",
-        f"| Reviewer models | {_model_label_from_state(state)} |",
+        _render_run_info(
+            state=state,
+            metadata=metadata,
+            mode_label=mode_label,
+        ),
+        "",
+        "---",
+        "",
+        "## 🇬🇧 English",
+        "",
+        "### Findings at a glance",
+        "",
+        english_overview.rstrip(),
+        "",
+        "### Why it matters",
+        "",
+        english_cards.rstrip(),
+        "",
+        "### Action checklist",
+        "",
+        _render_action_checklist_en(table_findings).rstrip(),
+        "",
+        _render_report_details("Full English report", english_report).rstrip(),
+        "",
+        "---",
+        "",
+        "## 🇨🇳 中文",
+        "",
+        "### 一览",
+        "",
+        chinese_overview.rstrip(),
+        "",
+        "### 为什么风险高",
+        "",
+        chinese_cards.rstrip(),
+        "",
+        "### 修复清单",
+        "",
+        _render_action_checklist_zh(table_findings, localized_cells).rstrip(),
+        "",
+        _render_report_details("完整中文报告", chinese_report).rstrip(),
+        _reviewer_error_block(state),
+        "",
+        "---",
+        "_Generated by CodeCross. API keys and Base URLs are read from CI/runtime "
+        "environment variables and are never written into this comment._",
     ]
-    if metadata.head_sha:
-        lines.append(f"| Commit | `{metadata.head_sha[:12]}` |")
-    if metadata.workflow_url:
-        lines.append(f"| CI run | [Open Actions run]({metadata.workflow_url}) |")
-
-    # ------------------------------------------------------------------
-    # 双语 Key Findings 表格段。即使 ``table_findings`` 为空也要保留这个
-    # 标题，给读者一个稳定的版面预期；空时下方会渲染一句"无 finding"。
-    # ------------------------------------------------------------------
-    lines.extend(
-        [
-            "",
-            "### Key Findings",
-            "",
-            "_Top findings shown in both English and Chinese. Tables share the "
-            "same row order so you can compare side by side._",
-            "",
-            "#### English",
-            "",
-            _render_findings_table_en(table_findings, board_summary)
-            if board_summary is not None
-            else "_No board summary available; see the JSON artifact._\n",
-            "",
-            "#### 中文",
-            "",
-            _render_findings_table_zh(
-                table_findings,
-                board_summary,
-                localized_cells,
-            )
-            if board_summary is not None
-            else "_暂无 Board 汇总数据；请查看 JSON artifact。_\n",
-        ]
-    )
-
-    lines.extend(
-        [
-            "",
-            "### English Report",
-            "",
-            english_report,
-            "",
-            "---",
-            "",
-            "### 中文报告",
-            "",
-            chinese_report,
-            _reviewer_error_block(state),
-            "",
-            "---",
-            "_Generated by CodeCross. API keys and Base URLs are read from CI/runtime "
-            "environment variables and are never written into this comment._",
-        ]
-    )
     return truncate_comment("\n".join(lines), max_chars)
 
 

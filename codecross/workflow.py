@@ -110,7 +110,7 @@ class CodeCrossState(TypedDict, total=False):
     final_report_en: str
     final_report_zh: str
     final_report: str
-    # 方案 B：PR 评论的双语 finding 表格用的"按 finding 翻译的中文短文本"。
+    # 方案 C：PR 评论中文镜像段用的"按 finding 翻译的中文短文本"。
     # key 是 Finding.finding_id，value 是中文 problem/impact/suggestion。
     # 翻译失败 / mock / 没配 localizer 时这里就是 {}，PR 评论会自动回退到英文。
     localized_finding_cells: dict[str, LocalizedFindingCell]
@@ -470,19 +470,20 @@ def final_report_node(state: CodeCrossState) -> dict[str, str]:
 def report_localizer_node(state: CodeCrossState) -> dict[str, Any]:
     """Graph 节点：把英文最终报告翻译成中文并合并成双语产物。
 
-    方案 B 之后这个节点除了产出整篇中文 Markdown，还要给 PR 评论的双语
-    finding 表格准备"按 finding 翻译的短文本"。两份产物用同一个 LLM
+    方案 C 的 PR 评论除了保留整篇中文 Markdown，还要给中文镜像段
+    准备"按 finding 翻译的短文本"。两份产物用同一个 LLM
     角色（report_localizer），但走两次独立调用：
         1. report_localizer_agent：翻译整篇 final report Markdown，给
-           "中文报告"段使用。
+           "完整中文报告"折叠块使用。
         2. finding_cells_localizer_agent：只翻译每条 finding 的
-           problem/impact/suggestion 三个短字段，给 PR 评论的中文表格使用。
+           problem/impact/suggestion 三个短字段，给中文一览表、Why 卡片
+           和修复清单使用。
     分两次调用而不是合并成一次的好处：
-        - 表格的 cell 翻译有严格 schema（dict[finding_id, ...]），可以
+        - 短字段翻译有严格 schema（dict[finding_id, ...]），可以
           被代码直接消费；和整篇 Markdown 翻译这种"自由文本"分开，错误
           路径互不影响。
         - 任意一边翻译失败，另一边不受影响：整篇报告翻译失败只影响
-          "中文报告"段；cell 翻译失败只让 PR 评论中文表格回退到英文。
+          "完整中文报告"；cell 翻译失败只让 PR 评论中文镜像段回退到英文。
     """
 
     english_report = state.get("final_report_en") or state.get("final_report", "")

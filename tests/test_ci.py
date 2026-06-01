@@ -109,6 +109,182 @@ def _sample_state() -> dict:
     }
 
 
+def _webapi_pr10_state() -> dict:
+    """Build the WebAPI PR #10 review shape from the layout proposal.
+
+    这个夹具专门保护真实 PR 示例里的 5 个风险项：以后排版再重构时，
+    只要少渲染一个 location/problem/action，这个测试就会失败。
+    """
+
+    rows = [
+        (
+            "finding_webapi_001",
+            "high",
+            "src/utils/oauthRedirect.js",
+            12,
+            14,
+            "Open redirect: `next` concatenated into URL without validation.",
+            "Attackers can redirect users from a trusted login flow to a phishing site.",
+            "Validate `next` against an allowlist of trusted origins.",
+            "开放重定向：`next` 未经校验直接拼接到 URL。",
+            "攻击者可把用户从受信登录流程跳到钓鱼站。",
+            "把 `next` 与受信 origin 白名单做匹配。",
+        ),
+        (
+            "finding_webapi_002",
+            "medium",
+            "src/utils/oauthRedirect.js",
+            19,
+            21,
+            "OAuth `state` logged in plaintext, defeating CSRF protection.",
+            "Leaked logs can expose the CSRF token that binds the browser session.",
+            "Stop logging the OAuth `state` value (or store only a truncated hash).",
+            "OAuth `state` 明文记录，CSRF 保护失效。",
+            "日志泄露会暴露绑定浏览器会话的 CSRF token。",
+            "不再打印 OAuth `state` 值（或只保留截断哈希）。",
+        ),
+        (
+            "finding_webapi_003",
+            "medium",
+            "src/utils/oauthRedirect.js",
+            27,
+            33,
+            "Unknown provider silently returns `undefined`, masking misconfig.",
+            "Typos and missing provider entries become indistinguishable from rejected requests.",
+            "Throw on unknown OAuth providers in `resolveProvider`.",
+            "未知 provider 静默返回 `undefined`，掩盖配置错误。",
+            "拼写错误或漏配会和被拒绝请求混在一起，难以排查。",
+            "`resolveProvider` 对未知 provider 抛错。",
+        ),
+        (
+            "finding_webapi_004",
+            "low",
+            ".github/workflows/codecross-pr-review.yml",
+            40,
+            None,
+            "Runner ref pinned by SHA but not integrity-verified.",
+            "A raw SHA pin without a signed tag or integrity check is harder to audit.",
+            "Pin CodeCross runner via a signed tag (or add a post-checkout integrity check).",
+            "Runner ref 仅按 SHA 固定，未做完整性校验。",
+            "裸 SHA 固定缺少签名 tag 或完整性检查，审计成本更高。",
+            "用签名 tag 固定 CodeCross runner（或加检出后完整性校验）。",
+        ),
+        (
+            "finding_webapi_005",
+            "low",
+            ".github/workflows/codecross-pr-review.yml",
+            118,
+            167,
+            "Fallback comment interpolates outcome vars without sanitization.",
+            "Unexpected workflow values can leak into the fallback PR comment body.",
+            "Validate workflow outcome variables against an explicit allowlist.",
+            "回退评论步骤未清理 outcome 变量直接拼接。",
+            "异常 workflow 值可能直接进入回退 PR 评论正文。",
+            "用显式白名单校验 workflow outcome 变量。",
+        ),
+    ]
+
+    findings = [
+        Finding(
+            finding_id=finding_id,
+            source_reviewer="security_reviewer",
+            model="deepseek/deepseek-chat",
+            category="security",
+            severity=severity,
+            file_path=file_path,
+            line_range=LineRange(start=start, end=end),
+            problem=problem,
+            evidence=f"Observed in {file_path}.",
+            impact=impact,
+            suggestion=suggestion,
+        )
+        for (
+            finding_id,
+            severity,
+            file_path,
+            start,
+            end,
+            problem,
+            impact,
+            suggestion,
+            _problem_zh,
+            _impact_zh,
+            _suggestion_zh,
+        ) in rows
+    ]
+    localized_cells = {
+        finding_id: LocalizedFindingCell(
+            finding_id=finding_id,
+            problem_zh=problem_zh,
+            impact_zh=impact_zh,
+            suggestion_zh=suggestion_zh,
+        )
+        for (
+            finding_id,
+            _severity,
+            _file_path,
+            _start,
+            _end,
+            _problem,
+            _impact,
+            _suggestion,
+            problem_zh,
+            impact_zh,
+            suggestion_zh,
+        ) in rows
+    }
+    return {
+        "reviewer_results": [
+            ReviewerResult(
+                reviewer_name="security_reviewer",
+                model="deepseek/deepseek-chat",
+                findings=findings,
+            ),
+            ReviewerResult(
+                reviewer_name="workflow_reviewer",
+                model="anthropic/claude-opus-4-6",
+                findings=[],
+            ),
+        ],
+        "findings": findings,
+        "localized_finding_cells": localized_cells,
+        "board_summary": BoardSummary(
+            reviewer_count=2,
+            finding_count=len(findings),
+            test_case_count=6,
+            passed_count=0,
+            failed_count=6,
+            finding_verifications={
+                finding.finding_id: FindingVerification(
+                    finding_id=finding.finding_id,
+                    status="supported",
+                    reason="Reproduced by generated tests.",
+                )
+                for finding in findings
+            },
+        ),
+        "evaluator_report": EvaluatorReport(
+            risk_level="high",
+            confidence="high",
+            recommended_action="Block merge until the OAuth redirect risks are fixed.",
+        ),
+        "final_report_en": (
+            "# CodeCross Final Review Report\n\n"
+            "## Risk Conclusion\n\n"
+            "- Risk level: `high`\n"
+            "- Confidence: `high`\n\n"
+            "## Key Findings\n\n"
+            "- Open redirect and OAuth state handling require fixes.\n"
+        ),
+        "final_report_zh": (
+            "# CodeCross 最终审查报告（中文）\n\n"
+            "## 风险结论\n\n"
+            "- 风险等级：`high`\n"
+            "- 建议动作：合并前修复 OAuth redirect 风险。\n"
+        ),
+    }
+
+
 def test_build_pr_comment_contains_marker_summary_and_findings():
     """The PR comment should be stable, compact, and useful at a glance."""
 
@@ -128,12 +304,17 @@ def test_build_pr_comment_contains_marker_summary_and_findings():
 
     assert COMMENT_MARKER in comment
     assert "CodeCross PR Review" in comment
-    assert "| Risk level | `high` |" in comment
-    assert "### English Report" in comment
-    assert "### 中文报告" in comment
-    assert "`src/app.py:12`" in comment
+    assert "> 🔴 **Block merge** · risk **high** · confidence **medium**" in comment
+    assert "<summary>Run info</summary>" in comment
+    assert "## 🇬🇧 English" in comment
+    assert "## 🇨🇳 中文" in comment
+    assert "### Findings at a glance" in comment
+    assert "### 一览" in comment
+    assert "`src/app.py:12-14`" in comment
+    assert "FINDING-001" in comment
     assert "abcdef123456" in comment
     assert "deepseek/deepseek-chat" in comment
+    assert comment.count("<details>") == 3
     assert "API keys and Base URLs" in comment
     assert "ModelCallError" not in comment
     assert "returned errors" in comment
@@ -145,7 +326,7 @@ def test_build_pr_comment_handles_empty_state():
     comment = build_pr_comment({})
 
     assert COMMENT_MARKER in comment
-    assert "| Risk level | `unknown` |" in comment
+    assert "> ⚪ **Comment** · risk **unknown** · confidence **medium**" in comment
     assert "Workflow did not produce a final report." in comment
     assert "中文化 Agent 没有返回译文" in comment
 
@@ -172,7 +353,7 @@ def test_build_pr_comment_posts_english_and_chinese_sections():
 
     comment = build_pr_comment(state)
 
-    assert comment.index("### English Report") < comment.index("### 中文报告")
+    assert comment.index("## 🇬🇧 English") < comment.index("## 🇨🇳 中文")
     assert "Order transaction bug." in comment
     assert "订单事务问题。" in comment
 
@@ -285,16 +466,16 @@ def test_read_diff_file_strips_utf8_bom(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 方案 B：PR 评论双语 finding 表格
+# 方案 C：PR 评论答题式布局
 # ---------------------------------------------------------------------------
-# 这一组测试聚焦"结构化数据 -> Markdown 表格"这一层，重点保护：
-#   1. 表格结构由代码生成，不受 LLM 输出影响。
-#   2. 中英文行序严格一致；翻译缺失时优雅回退到英文。
+# 这一组测试聚焦"结构化数据 -> Markdown 评论"这一层，重点保护：
+#   1. 一览表、Why 卡片、修复清单的结构由代码生成，不受 LLM 输出影响。
+#   2. 中英文段使用同一批 finding，行序严格一致；翻译缺失时优雅回退英文。
 #   3. 危险字符（``|``、换行）不会破坏 Markdown 表格语法。
 
 
 def test_build_pr_comment_renders_bilingual_finding_tables():
-    """PR 评论应同时给出英文表格和中文表格。"""
+    """PR 评论应同时给出中英文一览表、Why 卡片和修复清单。"""
 
     state = _sample_state()
     finding = state["findings"][0]
@@ -309,30 +490,34 @@ def test_build_pr_comment_renders_bilingual_finding_tables():
 
     comment = build_pr_comment(state)
 
-    # 英文表格头出现一次。
-    assert "| Severity | Verification | Location | Problem | Suggestion |" in comment
-    # 英文行：severity 标签是代码生成的（不是 schema 字面量小写）。
-    assert "| High | supported | `src/app.py:12-14` |" in comment
+    # 英文一览表只保留三列，severity 标签是代码生成的短 badge。
+    assert "| Sev | Location | Problem |" in comment
+    assert "| 🔴 H | `src/app.py:12-14` |" in comment
 
-    # 中文表格头与中文标签都来自代码常量。
-    assert "| 严重级别 | 验证状态 | 位置 | 问题 | 建议 |" in comment
-    assert "| 高 | 已被证据支持 | `src/app.py:12-14` |" in comment
+    # 中文一览表与中文标签都来自代码常量。
+    assert "| 严重 | 位置 | 问题 |" in comment
+    assert "| 🔴 高 | `src/app.py:12-14` |" in comment
     # 中文 problem 文本来自 localizer 翻译产物。
     assert "新分支可能在调用方期望字符串时返回 None。" in comment
+    assert "### Why it matters" in comment
+    assert "- **What:** The new branch can return None where callers expect a string." in comment
+    assert "- **问题：** 新分支可能在调用方期望字符串时返回 None。" in comment
+    assert "- [ ] Preserve the string contract or update all callers and tests." in comment
+    assert "- [ ] 保持字符串契约，或同步更新所有调用方与测试。" in comment
 
 
 def test_build_pr_comment_falls_back_to_english_when_localization_missing():
-    """没有 localized_finding_cells 时中文表格应回退到英文文本（不出现空格子）。"""
+    """没有 localized_finding_cells 时中文镜像段应回退到英文文本。"""
 
     state = _sample_state()
     state.pop("localized_finding_cells", None)
 
     comment = build_pr_comment(state)
 
-    # 中文表格存在，但 problem/suggestion 列回退到英文 finding 原文。
-    assert "| 严重级别 | 验证状态 | 位置 | 问题 | 建议 |" in comment
+    # 中文段存在，但 problem/impact/suggestion 回退到英文 finding 原文。
+    assert "| 严重 | 位置 | 问题 |" in comment
     assert "The new branch can return None where callers expect a string." in comment
-    # 同一段英文同时出现在英文表格里——也就是行序对齐时双语都能看到。
+    # 同一段英文同时出现在英文段和中文回退段里——也就是行序对齐时双语都能看到。
     assert comment.count("The new branch can return None where callers expect a string.") >= 2
 
 
@@ -356,20 +541,19 @@ def test_build_pr_comment_escapes_pipes_in_table_cells():
 
     # 转义后的反斜杠加竖线必须出现，而不是裸 ``|``。
     assert r"Pipe in problem \| should be escaped" in comment
-    assert r"Use replace('\|', '/')" in comment
     assert r"problem 中含有 \| 应当转义" in comment
+    # suggestion 不在表格里，保留原 Markdown 文本即可。
+    assert "Use replace('|', '/')" in comment
 
-    # 验证表格仍然是合法 5 列：找到表格行数 = 1 标题 + 1 分隔 + N 行数据。
-    # 这里只验证数据行的列数，因为单元格里转义后仍然是 5 个 ``|`` 分隔符。
+    # 验证表格仍然是合法 3 列：数据行应只有 4 个未转义 ``|``（含两端）。
     for line in comment.splitlines():
-        if line.startswith("| High |") or line.startswith("| 高 |"):
-            # 5 列产生 6 个 ``|``（含两端）。转义后的 ``\|`` 不能被算成分隔符。
+        if line.startswith("| 🔴 H |") or line.startswith("| 🔴 高 |"):
             unescaped = line.replace(r"\|", "")
-            assert unescaped.count("|") == 6, f"Broken table row: {line!r}"
+            assert unescaped.count("|") == 4, f"Broken table row: {line!r}"
 
 
 def test_build_pr_comment_table_drops_refuted_findings():
-    """已被证据反驳的 finding 不应出现在 PR 评论的表格里。"""
+    """已被证据反驳的 finding 不应出现在 PR 评论顶层速读区里。"""
 
     state = _sample_state()
     finding = state["findings"][0]
@@ -383,10 +567,66 @@ def test_build_pr_comment_table_drops_refuted_findings():
 
     comment = build_pr_comment(state)
 
-    # finding 行不应出现在英文/中文表格里。
-    assert "| High | refuted |" not in comment
-    assert "| 高 | 已被证据反驳 |" not in comment
+    # finding 行不应出现在英文/中文一览表里。
+    assert "| 🔴 H | `src/app.py:12-14` |" not in comment
+    assert "| 🔴 高 | `src/app.py:12-14` |" not in comment
     # 但 finding 文本仍然可能出现在 final_report_en 自由文本里——
     # 这里我们只关心表格区段。空表格会显示一句"暂无"。
     assert "_No remaining key findings to display._" in comment
     assert "_暂无需要展示的关键 finding。_" in comment
+
+
+def test_build_pr_comment_webapi_pr10_keeps_all_risk_items():
+    """WebAPI PR #10 的 5 个风险项都应出现在新版 PR 评论顶层。"""
+
+    comment = build_pr_comment(
+        _webapi_pr10_state(),
+        metadata=PullRequestMetadata(
+            repository="private/webapi",
+            pr_number=10,
+            head_sha="bdf2e1aa4974ffff",
+            workflow_url="https://github.example/actions/runs/10",
+        ),
+    )
+
+    assert "> 🔴 **Block merge** · risk **high** · confidence **high**" in comment
+    assert (
+        "1 high-severity finding has reproducible test evidence "
+        "(6/6 tests failed, 0 passed)."
+    ) in comment
+    assert comment.count("<details>") == 3
+    assert "FINDING-005" in comment
+
+    expected_locations = [
+        "src/utils/oauthRedirect.js:12-14",
+        "src/utils/oauthRedirect.js:19-21",
+        "src/utils/oauthRedirect.js:27-33",
+        ".github/workflows/codecross-pr-review.yml:40",
+        ".github/workflows/codecross-pr-review.yml:118-167",
+    ]
+    for location in expected_locations:
+        assert f"`{location}`" in comment
+
+    expected_problems = [
+        "Open redirect: `next` concatenated into URL without validation.",
+        "OAuth `state` logged in plaintext, defeating CSRF protection.",
+        "Unknown provider silently returns `undefined`, masking misconfig.",
+        "Runner ref pinned by SHA but not integrity-verified.",
+        "Fallback comment interpolates outcome vars without sanitization.",
+    ]
+    for problem in expected_problems:
+        assert problem in comment
+
+    expected_actions = [
+        "Validate `next` against an allowlist of trusted origins.",
+        "Stop logging the OAuth `state` value (or store only a truncated hash).",
+        "Throw on unknown OAuth providers in `resolveProvider`.",
+        "Pin CodeCross runner via a signed tag (or add a post-checkout integrity check).",
+        "Validate workflow outcome variables against an explicit allowlist.",
+    ]
+    for action in expected_actions:
+        assert f"- [ ] {action}" in comment
+
+    assert "开放重定向：`next` 未经校验直接拼接到 URL。" in comment
+    assert "回退评论步骤未清理 outcome 变量直接拼接。" in comment
+    assert "- [ ] 用显式白名单校验 workflow outcome 变量。" in comment

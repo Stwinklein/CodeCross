@@ -449,7 +449,7 @@ class LocalizedReport(CodeCrossModel):
 
 
 # ---------------------------------------------------------------------------
-# 方案 B：PR 评论的双语 finding 表格需要"按 finding 翻译几个短字段"。
+# 方案 C：PR 评论的中文镜像段需要"按 finding 翻译几个短字段"。
 # 这里定义两个轻量结构：
 #   - LocalizedFindingCell：单条 finding 的中文 problem/suggestion/impact。
 #   - LocalizedFindingCells：上一层的容器，方便 LLM 一次性返回整批，
@@ -459,11 +459,11 @@ class LocalizedReport(CodeCrossModel):
 # LLM 自由翻译，否则容易出现"严重 / 严重风险 / Critical"等不一致写法。
 # ---------------------------------------------------------------------------
 class LocalizedFindingCell(CodeCrossModel):
-    """单条 finding 在 PR 评论中文表格里的三个文本单元格。
+    """单条 finding 在 PR 评论中文镜像段里的三个短文本。
 
     finding_id 是关键回填字段：Localizer 必须原样保留它，PR 评论渲染
     时按 finding_id 拼回结构化数据。如果 LLM 漏返回某条 finding，就回
-    退到英文原文，保证表格永远有内容（不会出现空白单元格）。
+    退到英文原文，保证一览表、卡片和修复清单都不会空掉。
     """
 
     finding_id: str = Field(
@@ -488,8 +488,8 @@ class LocalizedFindingCells(CodeCrossModel):
 
     这是一个简单的"批量翻译"产物：输入 N 个 finding 的英文短文本，
     输出对应 N 条中文翻译。PR 评论按 finding_id 索引到对应中文文本，
-    然后把它和 severity/verification_status 这些结构化字段一起塞进 Markdown
-    表格的中文版。
+    然后把它和 severity / verification_status / location 这些结构化字段
+    一起渲染进中文一览表、Why 卡片和修复清单。
     """
 
     cells: list[LocalizedFindingCell] = Field(
