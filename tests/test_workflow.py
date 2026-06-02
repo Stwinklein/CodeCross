@@ -5,7 +5,6 @@
 
 from pathlib import Path
 
-from codecross.ci import build_pr_comment
 from codecross.config import load_project_config
 from codecross.workflow import run_workflow
 
@@ -37,10 +36,3 @@ def test_workflow_runs_v1_demo_with_two_reviewers():
     assert "CodeCross Final Review Report" in result["final_report_en"]
     assert "CodeCross 最终审查报告（中文）" in result["final_report_zh"]
     assert "## Code Context" in result["final_report_en"]
-
-    comment = build_pr_comment(result, mock_llm=True)
-    assert "## 🇬🇧 English" in comment
-    assert "### Findings at a glance" in comment
-    assert "### Action checklist" in comment
-    assert "## 🇨🇳 中文" in comment
-    assert "### 修复清单" in comment

@@ -1531,26 +1531,26 @@ def combine_bilingual_report(*, english_report: str, chinese_report: str) -> str
 
 
 # ---------------------------------------------------------------------------
-# 方案 C：PR 评论中文镜像段短字段翻译
+# 方案 B：PR 评论双语 finding 表格
 # ---------------------------------------------------------------------------
 # 设计目标
-#   1. 评论的"骨架"（severity / verification / location / details / task
-#      list）由代码渲染，永远是确定的字符串，LLM 不参与。
+#   1. 表格的"骨架"（severity / verification / location 列）由代码渲染，
+#      永远是确定的字符串，LLM 不参与，避免 markdown 表格被破坏。
 #   2. 只把每条 finding 的 problem / impact / suggestion 三个短文本字段
 #      交给 LLM 翻译，并强制按 finding_id 一一回填，缺失/翻译失败时回退
-#      到英文原文，保证中文一览表、Why 卡片和修复清单不会空掉。
+#      到英文原文，保证表格不会出现空格子。
 #   3. 整批 finding 一次调用模型，省 token 也保证术语一致。
 # ---------------------------------------------------------------------------
 
 
 def _finding_id_to_english_cell(finding: Finding) -> dict[str, str]:
-    """提取一条 finding 在 PR 评论中文镜像段中需要翻译的英文短字段。
+    """提取一条 finding 在 PR 评论表格中需要翻译的英文单元格内容。
 
     放到独立函数里有两个目的：
       * 给 ``finding_cells_localizer_agent`` 拼 prompt 用，保证只暴露
         必要字段（不会把 evidence、reproduction_hint 等多余信息送进去）。
       * 给 ``build_pr_comment`` 在中文翻译缺失时做"英文回退"用，保证
-        中文一览表、Why 卡片和修复清单永远有内容。
+        中文表格永远有内容。
     """
 
     return {
@@ -1571,7 +1571,7 @@ def finding_cells_localizer_agent(
     返回值用 ``dict[finding_id, LocalizedFindingCell]`` 形式，方便 PR
     评论渲染时按 finding_id 直接索引。这样：
       * 调用方不需要做线性查找；
-      * 翻译缺失某条 finding 时，可以立刻用英文回退而不打乱镜像段行序。
+      * 翻译缺失某条 finding 时，可以立刻用英文回退而不打乱表格行序。
 
     错误处理策略
         所有异常路径都返回空字典，让调用方走"英文回退"：
@@ -1587,7 +1587,7 @@ def finding_cells_localizer_agent(
 
     if config.mock_llm:
         # mock 模式：给一个机械翻译，方便本地 demo / 单元测试。
-        # 这里的中文不是高质量翻译，只是为了让 PR 评论中文镜像段可见。
+        # 这里的中文不是高质量翻译，只是为了让 PR 评论里中文表格可见。
         return {
             finding.finding_id: LocalizedFindingCell(
                 finding_id=finding.finding_id,
@@ -1600,7 +1600,7 @@ def finding_cells_localizer_agent(
 
     settings = config.model_config.get("report_localizer")
     if settings is None:
-        # 没配 localizer，就让 PR 评论中文镜像段自动回退到英文。
+        # 没配 localizer，就让 PR 评论中文表格自动回退到英文。
         return {}
 
     # 只暴露 finding_id + 三个待翻译字段，避免把上下文全塞进 prompt。
