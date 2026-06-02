@@ -1286,6 +1286,51 @@ def _short_text(text: str, fallback: str = "not provided") -> str:
     return "\n\n".join(cleaned_paragraphs)
 
 
+def _table_cell(value: object, fallback: str = "none") -> str:
+    """Format arbitrary report text so it is safe inside a Markdown table cell.
+
+    GitHub tables are fragile: a raw ``|`` creates a new column and a real
+    newline breaks the row. Keeping this small escape hatch in one place lets
+    the report use tables without changing the reviewer/evaluator content.
+    """
+
+    if value is None:
+        return fallback
+    # Preserve intentional single newlines from structured report fragments
+    # such as "Problem / Impact / Recommendation"; turn them into <br> only
+    # after normalizing whitespace inside each line.
+    parts = [" ".join(part.split()) for part in str(value).splitlines()]
+    parts = [part for part in parts if part]
+    compact = "<br>".join(parts) if parts else fallback
+    return compact.replace("|", "\\|")
+
+
+def _render_kv_table(rows: list[tuple[str, object]]) -> str:
+    """Render a compact two-column table for field/value style sections."""
+
+    lines = ["| Field | Value |", "| --- | --- |"]
+    for field, value in rows:
+        lines.append(f"| {_table_cell(field)} | {_table_cell(value)} |")
+    return "\n".join(lines)
+
+
+def _items_cell(items: list[str]) -> str:
+    """Render a list of short structured values as one item per table line."""
+
+    if not items:
+        return "none"
+    return "\n".join(f"- {item}" for item in items)
+
+
+def _format_failed_tests_for_table(summary: str) -> str:
+    """Add soft line breaks around repeated pytest failures before table escape."""
+
+    cleaned = _short_text(summary, "No failed-test details were reported.")
+    cleaned = re.sub(r"\s+(Reproduced on rerun\.)", r"\n\1", cleaned)
+    cleaned = re.sub(r"\s+(FAILED\s+\S+::)", r"\n\1", cleaned)
+    return cleaned
+
+
 def _line_location(finding: Finding) -> str:
     start = finding.line_range.start
     if start is None:
@@ -1331,7 +1376,10 @@ def _render_key_findings(
     *,
     limit: int = 10,
 ) -> str:
-    lines: list[str] = []
+    rows: list[str] = [
+        "| Severity | Verification | Location | Finding |",
+        "| --- | --- | --- | --- |",
+    ]
     seen: dict[tuple[str, str, int | None, int | None, str], list[Finding]] = {}
     for finding in sorted(findings, key=_finding_sort_key):
         verification = board_summary.finding_verifications.get(finding.finding_id)
@@ -1344,18 +1392,24 @@ def _render_key_findings(
         verification = board_summary.finding_verifications.get(finding.finding_id)
         status = verification.status if verification else "unverified"
         duplicate_note = f" ({len(grouped)} similar findings merged)" if len(grouped) > 1 else ""
-        lines.append(
-            f"- [`{finding.severity}` / `{status}`] `{_line_location(finding)}`: "
-            f"{_short_text(finding.problem)}{duplicate_note}\n"
-            f"  - Impact: {_short_text(finding.impact)}\n"
-            f"  - Recommendation: {_short_text(finding.suggestion)}"
+        finding_cell = (
+            f"Problem: {_short_text(finding.problem)}{duplicate_note}\n"
+            f"Impact: {_short_text(finding.impact)}\n"
+            f"Recommendation: {_short_text(finding.suggestion)}"
+        )
+        rows.append(
+            f"| `{_table_cell(finding.severity)}` | `{_table_cell(status)}` | "
+            f"`{_table_cell(_line_location(finding))}` | {_table_cell(finding_cell)} |"
         )
 
-    if not lines:
+    if not seen:
         return "No remaining key findings."
     if len(seen) > limit:
-        lines.append(f"- ... {len(seen) - limit} more findings are available in the JSON artifact.")
-    return "\n".join(lines)
+        rows.append(
+            f"| more | see artifact | JSON artifact | "
+            f"{len(seen) - limit} more findings are available in the JSON artifact. |"
+        )
+    return "\n".join(rows)
 
 
 def render_final_report(
@@ -1372,24 +1426,21 @@ def render_final_report(
     # Keep the source report in English. A dedicated Report Localizer Agent runs
     # after this node and produces the Chinese translation from this canonical
     # artifact, which prevents two independent localization systems from drifting.
-    reviewer_sections: list[str] = []
+    reviewer_rows = [
+        "| Reviewer | Model | Findings | Test intents | Errors | Notes |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
     for result in reviewer_results:
-        reviewer_notes = _short_text(
-            result.reviewer_notes,
-            "Reviewer notes are available in the structured JSON artifact.",
+        reviewer_rows.append(
+            "| "
+            f"{_table_cell(result.reviewer_name)} | "
+            f"{_table_cell(result.model)} | "
+            f"{len(result.findings)} | "
+            f"{len(result.test_intents)} | "
+            f"{len(result.errors)} | "
+            f"{_table_cell(result.reviewer_notes, 'Reviewer notes are available in the structured JSON artifact.')} |"
         )
-        reviewer_sections.append(
-            "\n".join(
-                [
-                    f"### {result.reviewer_name}",
-                    f"- Model: {result.model}",
-                    f"- Findings: {len(result.findings)}",
-                    f"- Test intents: {len(result.test_intents)}",
-                    f"- Errors: {len(result.errors)}",
-                    reviewer_notes,
-                ]
-            )
-        )
+    reviewer_outputs = "\n".join(reviewer_rows)
 
     high_risk_section = ""
     if high_risk_review:
@@ -1413,10 +1464,15 @@ def render_final_report(
     if code_context:
         context_section = (
             "\n## Code Context\n\n"
-            f"- Changed files: {_join_or_none(code_context.changed_files)}\n"
-            f"- Changed symbols: {_join_or_none(code_context.changed_symbols)}\n"
-            f"- Context snippets: {len(code_context.snippets)}\n"
-            f"- Missing files: {_join_or_none(code_context.missing_files)}\n\n"
+            + _render_kv_table(
+                [
+                    ("Changed files", _items_cell(code_context.changed_files)),
+                    ("Changed symbols", _items_cell(code_context.changed_symbols)),
+                    ("Context snippets", len(code_context.snippets)),
+                    ("Missing files", _items_cell(code_context.missing_files)),
+                ]
+            )
+            + "\n\n"
         )
 
     findings = [finding for result in reviewer_results for finding in result.findings]
@@ -1447,24 +1503,45 @@ def render_final_report(
     return (
         "# CodeCross Final Review Report\n\n"
         f"## Risk Conclusion\n\n"
-        f"- Risk level: `{evaluator_report.risk_level}`\n"
-        f"- Confidence: `{evaluator_report.confidence}`\n"
-        f"- Reasoning: {_short_text(evaluator_report.reasoning)}\n"
-        f"- Recommended action: {_short_text(evaluator_report.recommended_action, _merge_advice(evaluator_report.risk_level))}\n\n"
+        + _render_kv_table(
+            [
+                ("Risk level", f"`{evaluator_report.risk_level}`"),
+                ("Confidence", f"`{evaluator_report.confidence}`"),
+                ("Reasoning", _short_text(evaluator_report.reasoning)),
+                (
+                    "Recommended action",
+                    _short_text(
+                        evaluator_report.recommended_action,
+                        _merge_advice(evaluator_report.risk_level),
+                    ),
+                ),
+            ]
+        )
+        + "\n\n"
         "## Review Plan\n\n"
-        f"- Changed files: {_join_or_none(review_plan.changed_files)}\n"
-        f"- Changed symbols: {_join_or_none(review_plan.changed_symbols)}\n"
-        f"- Risk areas: {_join_or_none(review_plan.risk_areas)}\n"
-        f"- Testing focus: {_join_or_none(review_plan.testing_focus)}\n\n"
+        + _render_kv_table(
+            [
+                ("Changed files", _items_cell(review_plan.changed_files)),
+                ("Changed symbols", _items_cell(review_plan.changed_symbols)),
+                ("Risk areas", _items_cell(review_plan.risk_areas)),
+                ("Testing focus", _items_cell(review_plan.testing_focus)),
+            ]
+        )
+        + "\n\n"
         + context_section
         + summary_section
         + "## Reviewer Outputs\n\n"
-        + "\n\n".join(reviewer_sections)
+        + reviewer_outputs
         + "\n\n"
         + render_board_markdown(board_summary)
         + "\n## Evidence Summary\n\n"
-        f"{evidence_summary}\n\n"
-        f"{failed_tests_summary}\n"
+        + _render_kv_table(
+            [
+                ("Evidence", evidence_summary),
+                ("Failed tests", _format_failed_tests_for_table(failed_tests_summary)),
+            ]
+        )
+        + "\n"
         + high_risk_section
     )
 

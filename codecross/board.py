@@ -583,16 +583,22 @@ def render_board_markdown(summary: BoardSummary) -> str:
         summary.stop_reason or "not stopped",
         summary.stop_reason or "not stopped",
     )
-    return (
-        "## Review Board\n\n"
-        f"- Reviewers: {summary.reviewer_count}\n"
-        f"- Findings: {summary.finding_count}\n"
-        f"- Test intents: {summary.test_intent_count}\n"
-        f"- Test cases: {summary.test_case_count}\n"
-        f"- Verification rounds: {summary.test_round_count}\n"
-        f"- Passed tests: {summary.passed_count}\n"
-        f"- Failed tests: {summary.failed_count}\n"
-        f"- Error/blocked tests: {summary.error_count}\n"
-        f"- Verification status: {status_text or 'none'}\n"
-        f"- Stop reason: {stop_reason}\n"
-    )
+    rows = [
+        ("Reviewers", summary.reviewer_count),
+        ("Findings", summary.finding_count),
+        ("Test intents", summary.test_intent_count),
+        ("Test cases", summary.test_case_count),
+        ("Verification rounds", summary.test_round_count),
+        ("Passed tests", summary.passed_count),
+        ("Failed tests", summary.failed_count),
+        ("Error/blocked tests", summary.error_count),
+        ("Verification status", status_text or "none"),
+        ("Stop reason", stop_reason),
+    ]
+    lines = ["## Review Board", "", "| Metric | Value |", "| --- | --- |"]
+    for metric, value in rows:
+        # The board summary is mostly numeric, but status/stop strings may still
+        # include punctuation. Escape pipes so a label can never split a row.
+        safe_value = str(value).replace("|", "\\|")
+        lines.append(f"| {metric} | {safe_value} |")
+    return "\n".join(lines) + "\n"

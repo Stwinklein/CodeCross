@@ -148,6 +148,7 @@ def test_board_markdown_is_english_source_report():
     markdown = render_board_markdown(summary)
 
     assert "## Review Board" in markdown
-    assert "Reviewers: 2" in markdown
-    assert "Stop reason: verification queue empty" in markdown
+    assert "| Metric | Value |" in markdown
+    assert "| Reviewers | 2 |" in markdown
+    assert "| Stop reason | verification queue empty |" in markdown
     assert "证据看板" not in markdown

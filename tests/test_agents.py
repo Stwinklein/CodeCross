@@ -251,14 +251,22 @@ def test_final_report_renders_english_and_deduplicates_findings():
     )
 
     assert "CodeCross Final Review Report" in report
-    assert "Risk level: `critical`" in report
+    assert "| Field | Value |" in report
+    assert "| Risk level | `critical` |" in report
+    assert "| Severity | Verification | Location | Finding |" in report
+    assert "| Reviewer | Model | Findings | Test intents | Errors | Notes |" in report
     assert "Block merge until fixed." in report
     assert "Path traversal vulnerability" in report
+    assert "Problem: Path traversal vulnerability" in report
+    assert "<br>Impact: Attackers can read files outside the upload root." in report
+    assert "Impact: Attackers can read files outside the upload root." in report
+    assert "Recommendation: Use path.resolve" in report
     assert "similar findings merged" in report
     assert "path.resolve" in report
     assert "high severity findings first" in report
     assert "High risk review confirms" in report
     assert "Review Board" in report
+    assert "| Metric | Value |" in report
     assert "checkout_codecross step removed" in report
     assert "A critical finding has supporting evidence" in report
     assert "Reviewer identified a blocking issue" in report
