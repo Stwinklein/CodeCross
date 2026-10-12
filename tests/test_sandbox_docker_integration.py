@@ -44,7 +44,7 @@ def test_generated_python_cannot_see_host_secret_or_network_and_cannot_change_so
         runner_config=RunnerConfig(test_timeout_seconds=15),
     )
 
-    assert result.status == "passed", result.stderr
+    assert result.status == "passed", f"{result.error_type}: {result.failure_summary}\n{result.stderr}"
     assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
     assert (tmp_path / ".env").read_text(encoding="utf-8") == "SECRET=host-only\n"
 
@@ -58,7 +58,7 @@ def test_native_javascript_test_runs_in_node_container(tmp_path: Path):
         test_code=(
             "const { test } = require('node:test');\n"
             "const assert = require('node:assert/strict');\n"
-            "test('adds', () => { assert.equal(require('../add.js').add(1, 2), 3); });\n"
+            "test('adds', () => { assert.equal(require(process.cwd() + '/add.js').add(1, 2), 3); });\n"
         ),
         expected_behavior="3",
     )
@@ -70,5 +70,58 @@ def test_native_javascript_test_runs_in_node_container(tmp_path: Path):
         runner_config=config, project_config=project,
     )
 
-    assert result.status == "passed", result.stderr
+    assert result.status == "passed", f"{result.error_type}: {result.failure_summary}\n{result.stderr}"
     assert not list(tmp_path.glob("*codecross*"))
+
+
+@pytest.mark.docker
+def test_python_process_limit_blocks_unbounded_children(tmp_path: Path):
+    _require_image("codecross-sandbox-python:3.12")
+    (tmp_path / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    case = TestCase(
+        source_agent="integration", target_file="module.py", test_name="test_process_limit",
+        test_code=(
+            "import subprocess\n\n"
+            "def test_process_limit():\n"
+            "    children = []\n"
+            "    try:\n"
+            "        for _ in range(100):\n"
+            "            children.append(subprocess.Popen(['sleep', '10']))\n"
+            "    except OSError:\n"
+            "        assert len(children) < 20\n"
+            "    else:\n"
+            "        assert False, 'PIDs limit did not stop process spawning'\n"
+        ),
+        expected_behavior="process count is limited",
+    )
+
+    result = run_sandboxed_test_once(
+        case, project_root=tmp_path, round_index=1,
+        runner_config=RunnerConfig(sandbox_pids_limit=16, test_timeout_seconds=5),
+    )
+
+    assert result.status == "passed", f"{result.error_type}: {result.failure_summary}\n{result.stderr}"
+
+
+@pytest.mark.docker
+def test_timeout_terminates_container_process_tree(tmp_path: Path):
+    _require_image("codecross-sandbox-python:3.12")
+    (tmp_path / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    case = TestCase(
+        source_agent="integration", target_file="module.py", test_name="test_never_ends",
+        test_code="import time\n\ndef test_never_ends():\n    while True:\n        time.sleep(1)\n",
+        expected_behavior="test must time out", timeout_seconds=2,
+    )
+
+    result = run_sandboxed_test_once(
+        case, project_root=tmp_path, round_index=1,
+        runner_config=RunnerConfig(test_timeout_seconds=2),
+    )
+
+    assert result.status == "timeout", f"{result.error_type}: {result.failure_summary}\n{result.stderr}"
+    assert result.duration_ms < 10_000
+    running = subprocess.run(
+        ["docker", "ps", "--filter", "name=codecross-", "--format", "{{.Names}}"],
+        capture_output=True, text=True, timeout=5, check=True,
+    )
+    assert not running.stdout.strip()
