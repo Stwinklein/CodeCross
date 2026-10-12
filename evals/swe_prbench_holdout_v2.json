@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "benchmark": "foundry-ai/swe-prbench",
+  "source_split": "eval_100",
+  "context_config": "config_C",
+  "status": "calibration_dev_first5_after_v0.8_feedback",
+  "seed": "codecross-v0.8-holdout-v2",
+  "schema_dev_exclusions": ["prowler__9865"],
+  "additional_exclusions": [
+    "server__8569",
+    "stylelint__9026",
+    "chia-blockchain__20317",
+    "ragas__2331",
+    "wakatime-cli__1245",
+    "protocompile__645",
+    "effect__5952",
+    "pipecat__3041",
+    "ratelimit__996",
+    "firebase-android-sdk__7617"
+  ],
+  "task_ids": [
+    "espnet__6356",
+    "coreos-assembler__4381",
+    "transformers.js__1436",
+    "falcon__2572",
+    "vitest__9152",
+    "stylelint__8953",
+    "chia-blockchain__20099",
+    "kedro__5334",
+    "prowler__9606",
+    "deepchem__4601",
+    "pipecat__3598",
+    "nessie__11676",
+    "kale__593",
+    "pip__13482",
+    "autogluon__5586",
+    "qutebrowser__8845",
+    "dask__12221",
+    "openbao__1906",
+    "spyder__24990",
+    "zod__5672"
+  ]
+}

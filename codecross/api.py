@@ -406,7 +406,13 @@ def _execute_run(run_id: str) -> None:
             return
 
         project_root = Path(record.request.project_root).resolve()
-        config = load_project_config(project_root, mock_llm=record.request.mock_llm)
+        # API 与 CLI 必须使用同一检测契约。monorepo 只看根目录清单会选错语言，
+        # 因此把本次请求 diff 一起交给 ProjectDetector。
+        config = load_project_config(
+            project_root,
+            mock_llm=record.request.mock_llm,
+            diff=record.request.diff,
+        )
         _apply_request_config(config, record.request)
 
         def on_workflow_event(kind: str, payload: dict[str, Any]) -> None:

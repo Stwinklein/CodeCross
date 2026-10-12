@@ -7,8 +7,12 @@ from codecross.config import ModelSettings, load_project_config
 from codecross.llm import ModelCallError
 from codecross.schemas import (
     BoardSummary,
+    CodeContext,
+    CodeContextSnippet,
     EvaluatorReport,
     Finding,
+    FindingCritiqueBatch,
+    FindingCritiqueDecision,
     FindingVerification,
     HighRiskReviewReport,
     LineRange,
@@ -57,6 +61,18 @@ def test_parse_changed_symbols_handles_javascript_and_hunk_headers():
     assert "pushKey" in symbols
     assert "buildPayload" in symbols
     assert "validModes" not in symbols
+
+
+def test_parse_changed_symbols_handles_go_java_and_rust():
+    diff = """diff --git a/a.go b/a.go
++func (s *Server) HandleRequest(ctx context.Context) error {
++pub async fn load_account(id: u64) -> Result<Account> {
++public static User findUser(String id) {
+"""
+
+    symbols = agents.parse_changed_symbols(diff)
+
+    assert {"HandleRequest", "load_account", "findUser"} <= set(symbols)
 
 
 def test_reviewer_fallbacks_only_on_model_call_error(monkeypatch):
@@ -119,6 +135,301 @@ def test_reviewer_agent_uses_a2a_when_endpoint_is_configured(monkeypatch):
 
     assert result.reviewer_name == "logic_reviewer"
     assert result.reviewer_notes == "a2a called for logic_reviewer"
+
+
+def test_reviewer_prompt_requires_concrete_repository_level_findings(monkeypatch):
+    """Prompt 必须抑制风格/猜测型意见，并要求检查跨文件契约。"""
+
+    captured = {}
+
+    def fake_call(settings, messages, schema):
+        captured["messages"] = messages
+        return ReviewerResult(reviewer_name="x", model="x")
+
+    monkeypatch.setattr(agents, "call_model_json", fake_call)
+    reviewer = ModelSettings(
+        role="reviewer",
+        provider="deepseek",
+        model="test",
+        focus="repository conventions and PR scope",
+    )
+    config = load_project_config(mock_llm=False, diff="diff --git a/a.py b/a.py\n")
+
+    result = agents.reviewer_agent(
+        reviewer=reviewer,
+        diff="diff --git a/a.py b/a.py\n",
+        review_plan=ReviewPlan(changed_files=["a.py"]),
+        config=config,
+    )
+
+    prompt = "\n".join(content for _, content in captured["messages"])
+    assert "repository-level" in prompt
+    assert "Report each root cause exactly once" in prompt
+    assert "Do not report style preferences" in prompt
+    assert "concrete trigger condition" in prompt
+    assert "same root-cause pattern occurs in several files" in prompt
+    assert "re-enter the same wrapper" in prompt
+    assert "fixture setup/cleanup identifiers" in prompt
+
+
+def test_review_only_planner_never_calls_model(monkeypatch):
+    monkeypatch.setattr(
+        agents,
+        "call_model_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called")),
+    )
+    config = load_project_config(mock_llm=False, evaluation_mode="review_only")
+
+    plan = agents.planner_agent("diff --git a/a.py b/a.py\n+def changed():\n+    pass\n", config)
+
+    assert plan.changed_files == ["a.py"]
+    assert "changed" in plan.changed_symbols
+
+
+def test_human_review_profile_includes_nonfunctional_but_actionable_concerns():
+    config = load_project_config(
+        mock_llm=True,
+        evaluation_mode="review_only",
+        review_profile="human_review_alignment",
+    )
+
+    policy = agents._review_profile_policy(config)
+
+    assert "resource lifecycle" in policy
+    assert "API idioms" in policy
+    assert "vague taste" in policy
+    assert config.finding_critic_enabled is False
+    assert config.semantic_deduplication_enabled is False
+    assert config.max_final_findings == 6
+    assert all(reviewer.temperature == 0.0 for reviewer in config.enabled_reviewers())
+
+
+def test_reviewer_does_not_repeat_diff_already_in_frozen_context(monkeypatch):
+    """公开 benchmark 上下文已含 patch 时，Prompt 中不得再出现第二份原始 diff。"""
+
+    captured = {}
+
+    def fake_call(settings, messages, schema):
+        captured["messages"] = messages
+        captured["schema"] = schema
+        return agents.BenchmarkReviewBatch(
+            comments=[
+                agents.BenchmarkReviewComment(
+                    body="A concise actionable concern.",
+                    file="a.py",
+                    line=7,
+                    severity="P1",
+                )
+            ]
+        )
+
+    monkeypatch.setattr(agents, "call_model_json", fake_call)
+    reviewer = ModelSettings(
+        role="reviewer",
+        provider="deepseek",
+        model="test",
+        focus="repository conventions and PR scope",
+    )
+    diff = "diff --git a/a.py b/a.py\n+UNIQUE_PATCH_MARKER\n"
+    config = load_project_config(
+        mock_llm=False,
+        diff=diff,
+        review_profile="human_review_alignment",
+    )
+    context = CodeContext(
+        contains_diff=True,
+        snippets=[
+            CodeContextSnippet(
+                kind="diagnostic",
+                file_path="<frozen>",
+                content=f"official rendered context\n{diff}",
+            )
+        ],
+    )
+
+    result = agents.reviewer_agent(
+        reviewer=reviewer,
+        diff=diff,
+        review_plan=ReviewPlan(changed_files=["a.py"]),
+        config=config,
+        code_context=context,
+    )
+
+    prompt = "\n".join(content for _, content in captured["messages"])
+    assert prompt.count("UNIQUE_PATCH_MARKER") == 1
+    assert "official rendered context" in prompt
+    assert "This is the maintainer-fidelity pass" in prompt
+    assert "defaults matching documentation and implementation" in prompt
+    assert "brittle inline UI layout" in prompt
+    assert "Correctness bugs, missing error handling" in prompt
+    assert "Do not flag issues in files you have not been shown" in prompt
+    assert "golden" not in prompt.lower()
+    assert "Review plan:" not in prompt
+    assert "Objective diff metadata:" not in prompt
+    assert captured["schema"] is agents.BenchmarkReviewBatch
+    assert len(result.findings) == 1
+    assert result.findings[0].problem == "A concise actionable concern."
+    assert result.findings[0].severity == "high"
+
+
+def test_finding_critic_rejects_only_high_confidence_false_candidate(monkeypatch):
+    first = Finding(
+        finding_id="keep", source_reviewer="r", model="m", category="runtime",
+        severity="high", file_path="a.py", problem="real", evidence="e", impact="i", suggestion="s"
+    )
+    second = first.model_copy(update={"finding_id": "reject", "problem": "contradicted"})
+
+    monkeypatch.setattr(
+        agents,
+        "call_model_json",
+        lambda *args, **kwargs: FindingCritiqueBatch(
+            decisions=[
+                FindingCritiqueDecision(finding_id="keep", keep=True, confidence=0.9),
+                FindingCritiqueDecision(finding_id="reject", keep=False, confidence=0.95),
+            ]
+        ),
+    )
+    config = load_project_config(mock_llm=False, evaluation_mode="review_only")
+
+    kept, rejected, error = agents.finding_critic_agent(
+        [first, second], diff="diff", code_context=None, config=config
+    )
+
+    assert [item.finding_id for item in kept] == ["keep"]
+    assert [item.finding_id for item in rejected] == ["reject"]
+    assert error == ""
+
+
+def test_final_finding_priority_prefers_cross_reviewer_consensus():
+    base = Finding(
+        source_reviewer="logic",
+        model="m",
+        category="runtime",
+        severity="high",
+        confidence="high",
+        file_path="single.py",
+        problem="single",
+        evidence="e",
+        impact="i",
+        suggestion="s",
+    )
+    consensus = base.model_copy(
+        update={
+            "finding_id": "consensus",
+            "file_path": "consensus.py",
+            "source_reviewers": ["logic", "security"],
+            "confidence": "medium",
+        }
+    )
+
+    selected = agents.prioritize_final_findings([base, consensus], limit=1)
+
+    assert selected[0].finding_id == "consensus"
+
+
+def test_final_finding_priority_balances_independent_reviewers():
+    """human review Top-K 不应被一路模型的高严重度推测全部占满。"""
+
+    findings = []
+    for index in range(5):
+        findings.append(
+            Finding(
+                finding_id=f"logic-{index}",
+                source_reviewer="logic",
+                model="deepseek/test",
+                category="runtime",
+                severity="high",
+                confidence="high",
+                file_path=f"logic_{index}.py",
+                problem=f"logic concern {index}",
+                evidence="e",
+                impact="i",
+                suggestion="s",
+            )
+        )
+    for index in range(3):
+        findings.append(
+            Finding(
+                finding_id=f"maintainer-{index}",
+                source_reviewer="maintainer",
+                model="anthropic/test",
+                category="maintainability",
+                severity="medium",
+                confidence="high",
+                file_path=f"maintainer_{index}.py",
+                problem=f"maintainer concern {index}",
+                evidence="e",
+                impact="i",
+                suggestion="s",
+            )
+        )
+
+    selected = agents.prioritize_final_findings(
+        findings,
+        limit=6,
+        balance_reviewers=True,
+    )
+
+    counts = {}
+    for finding in selected:
+        counts[finding.source_reviewer] = counts.get(finding.source_reviewer, 0) + 1
+    assert counts == {"logic": 3, "maintainer": 3}
+
+
+def test_human_priority_covers_new_files_before_repeating_one_location():
+    """Top-K 应优先覆盖测试文件，不能被同一实现行的近义候选占满。"""
+
+    def make_finding(
+        finding_id: str,
+        reviewer: str,
+        file_path: str,
+        line: int,
+    ) -> Finding:
+        return Finding(
+            finding_id=finding_id,
+            source_reviewer=reviewer,
+            model="fixture/model",
+            category="human_review",
+            severity="high",
+            confidence="high",
+            file_path=file_path,
+            line_range=LineRange(start=line, end=line),
+            problem=f"concern {finding_id}",
+            evidence="e",
+            impact="i",
+            suggestion="s",
+        )
+
+    findings = [
+        make_finding("impl-a", "logic", "src/manager.py", 100),
+        make_finding("impl-b", "maintainer", "src/manager.py", 102),
+        make_finding("impl-c", "logic", "src/manager.py", 103),
+        make_finding("test", "maintainer", "tests/test_manager.py", 40),
+    ]
+
+    selected = agents.prioritize_final_findings(
+        findings,
+        limit=2,
+        balance_reviewers=True,
+    )
+
+    assert {item.finding_id for item in selected} == {"impl-a", "test"}
+
+
+def test_benchmark_maintainer_focus_requires_hunk_and_test_coverage():
+    reviewer = ModelSettings(
+        role="reviewer",
+        provider="anthropic",
+        model="test",
+        focus="repository conventions, PR scope, and test organization",
+    )
+
+    focus = agents._benchmark_reviewer_focus(reviewer)
+
+    assert "every shown changed file and hunk" in focus
+    assert "signal/event assertions" in focus
+    assert "speculative runtime failure" in focus
+
 
 
 def test_mock_test_author_adds_normal_path_control_case():

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 """确定性测试执行器。
 
-这个模块不调用 LLM，也不判断最终风险。它只负责把 TestCase 写成临时 pytest 文件，
-真实执行 pytest，然后把 stdout/stderr/exit code 收集成 TestResult。
+这个模块不调用 LLM，也不判断最终风险。Python pytest 保留在本文件中；
+Jest/Vitest、Go、Java、Rust、Ruby 等原生框架由 native_executor 适配后统一路由，
+最终都收敛成 TestResult 交给 Board。
 """
 
 import os
@@ -18,6 +19,7 @@ from pathlib import Path
 
 from .config import RunnerConfig
 from .cross_verification.triggers import detect_cross_verification_trigger
+from .native_executor import NATIVE_TEST_TYPES, execute_native_test_case
 from .schemas import (
     CodeContext,
     CrossVerificationPayload,
@@ -440,8 +442,9 @@ def _run_pytest_once(
                 if not current_pythonpath
                 else str(root) + os.pathsep + current_pythonpath
             )
+            command = [sys.executable, "-m", "pytest", str(test_file), "-q"]
             completed = subprocess.run(
-                [sys.executable, "-m", "pytest", str(test_file), "-q"],
+                command,
                 cwd=root,
                 capture_output=True,
                 text=True,
@@ -461,6 +464,8 @@ def _run_pytest_once(
             failure_summary="pytest execution timed out",
             error_type="timeout",
             related_finding_ids=test_case.related_finding_ids,
+            executor_name="pytest",
+            executor_command=locals().get("command", []),
         )
     finally:
         # TemporaryDirectory 会清理子目录；这里顺手删除空的父目录。
@@ -490,6 +495,8 @@ def _run_pytest_once(
         error_type=error_type,
         is_reproducible=status == "failed",
         related_finding_ids=test_case.related_finding_ids,
+        executor_name="pytest",
+        executor_command=command,
     )
 
 
@@ -622,6 +629,29 @@ def execute_test_cases(
                 )
             )
             continue
+        if test_case.test_type in NATIVE_TEST_TYPES:
+            # 原生执行需要 ProjectDetector 的结构化命令和项目框架信息。缺配置时
+            # 明确记为 not_testable，不能默默退回 pytest 或把环境问题当成 finding 证据。
+            if project_config is None:
+                results.append(
+                    _skipped_result(
+                        test_case,
+                        round_index,
+                        "原生测试缺少 project_config，无法安全选择执行命令。",
+                        error_type="not_testable_missing_project_config",
+                    )
+                )
+                continue
+            results.append(
+                execute_native_test_case(
+                    test_case,
+                    project_root=project_root,
+                    round_index=round_index,
+                    runner_config=runner_config,
+                    project_config=project_config,
+                )
+            )
+            continue
         if test_case.test_type not in {"pytest", "static_check"}:
             # Issue #2：在放弃之前，检查是否应该走 LLM 交叉验证 fallback。
             # 典型场景：mock 生成器对 JS 文件产出 test_type=manual，但 target_language
@@ -661,14 +691,18 @@ def execute_test_cases(
                 )
             )
             continue
-        results.append(
-            execute_pytest_case(
+        pytest_result = execute_pytest_case(
                 test_case,
                 project_root=project_root,
                 round_index=round_index,
                 runner_config=runner_config,
             )
-        )
+        # static_check 的代码仍由 pytest 执行，但证据语义是“静态读取源码”。
+        # 单独标记后，LangSmith 可以区分真实行为测试与只读结构断言。
+        if test_case.test_type == "static_check":
+            pytest_result.evidence_kind = "static"
+            pytest_result.executor_name = "pytest-static"
+        results.append(pytest_result)
     for test_case in test_cases[execution_limit:]:
         results.append(
             _skipped_result(

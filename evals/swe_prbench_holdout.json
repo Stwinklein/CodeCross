@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "benchmark": "foundry-ai/swe-prbench",
+  "source_split": "eval_100",
+  "context_config": "config_C",
+  "status": "calibration_dev_after_v0.5_feedback",
+  "seed": "codecross-v0.2-holdout",
+  "schema_dev_exclusions": [
+    "prowler__9865"
+  ],
+  "task_ids": [
+    "server__8569",
+    "stylelint__9026",
+    "chia-blockchain__20317",
+    "ragas__2331",
+    "wakatime-cli__1245",
+    "protocompile__645",
+    "effect__5952",
+    "pipecat__3041",
+    "ratelimit__996",
+    "firebase-android-sdk__7617"
+  ]
+}

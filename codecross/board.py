@@ -36,6 +36,7 @@ VERIFICATION_STATUS_LABELS = {
     "unverified": "unverified",
     "inconclusive": "inconclusive",
     "not_testable": "not automatically testable",
+    "not_reproduced": "not reproduced by generated tests",
     # Issue #2：模型交叉验证产生的 verification 状态。中文标签和 pytest 路径
     # 区分开，让 PR 评论一眼能看出“这条结论由谁背书”。
     "cross_supported": "LLM cross-check supported",
@@ -289,7 +290,7 @@ def _result_to_evidence(result: TestResult) -> EvidenceItem:
     elif result.status == "passed":
         evidence_type = "test_pass"
         strength = "medium"
-    elif result.status == "unsafe":
+    elif result.status == "unsafe" or result.error_type.startswith("not_testable_"):
         evidence_type = "coverage_gap"
         strength = "medium"
     else:
@@ -333,7 +334,7 @@ def _apply_cross_decision(
     这层保护在调用点之前就该过滤，但这里再校一道更保险。
     """
 
-    if previous_status in {"supported", "refuted", "not_testable"}:
+    if previous_status in {"supported", "refuted", "not_testable", "not_reproduced"}:
         return
 
     confirmed = counts.get("confirmed", 0)
@@ -378,7 +379,7 @@ def update_finding_verifications_from_results(
 
     这是 V1.1 的核心证据规则：
     - 相关测试 failed 且可复现 => finding supported
-    - 相关测试 passed          => finding refuted，但只给 medium confidence
+    - 相关测试 passed          => finding not_reproduced；只有明确反证才能 refuted
     - flaky/error/timeout      => inconclusive，不能支持也不能反驳
     - unsafe                  => not_testable，需要人工处理
     """
@@ -458,16 +459,22 @@ def update_finding_verifications_from_results(
                 )
                 verification.next_action = "Rerun or generate a narrower test before trusting this evidence."
             elif result.status == "passed" and verification.status != "supported":
-                verification.status = "refuted"
-                verification.confidence = "medium"
+                verification.status = "not_reproduced"
+                verification.confidence = "low"
                 verification.reason = (
-                    "The generated pytest case passed, so this suspected issue was not reproduced."
+                    "The generated test passed, so this run did not reproduce the suspected issue; "
+                    "test coverage alone is not a counterexample."
                 )
-                verification.next_action = "No further automated verification is needed."
-            elif result.status == "unsafe" and verification.status not in {"supported", "refuted"}:
+                verification.next_action = "Keep for review or construct an explicit counterexample."
+            elif (
+                result.status == "unsafe" or result.error_type.startswith("not_testable_")
+            ) and verification.status not in {"supported", "refuted"}:
                 verification.status = "not_testable"
                 verification.confidence = "medium"
-                verification.reason = "The generated test was blocked by the sanitizer."
+                verification.reason = (
+                    "The generated test could not run safely or the required build environment "
+                    "was unavailable."
+                )
                 verification.next_action = "Manual review is required."
             elif verification.status not in {"supported", "refuted", "not_testable"}:
                 verification.status = "inconclusive"

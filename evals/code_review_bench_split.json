@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "benchmark": "code-review-bench-50",
+  "strategy": "repository_family_holdout",
+  "notes": "Sentry, Cal.com, Discourse, and Grafana are development repositories because aggregate or stability feedback was used. Keycloak is the remaining untouched pilot; a second benchmark is required for holdout.",
+  "source_file_phases": {
+    "sentry.json": "dev",
+    "cal_dot_com.json": "dev",
+    "discourse.json": "dev",
+    "grafana.json": "dev",
+    "keycloak.json": "pilot"
+  }
+}

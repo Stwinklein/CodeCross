@@ -19,11 +19,14 @@ from .agents import (
     coverage_gap_agent,
     evaluator_agent,
     finding_cells_localizer_agent,
+    finding_critic_agent,
     high_risk_review_agent,
     planner_agent,
+    prioritize_final_findings,
     report_localizer_agent,
     render_final_report,
     reviewer_agent,
+    semantic_deduplication_batch_agent,
     targeted_reviewer_agent,
     test_author_agent,
     test_case_agent,
@@ -42,6 +45,11 @@ from .board import (
     update_finding_verifications_from_results,
 )
 from .config import ProjectConfig, load_project_config
+from .deduplication import (
+    deduplicate_findings,
+    remap_test_intents,
+    merge_explicit_finding_groups,
+)
 from .executor import execute_test_cases
 from .schemas import (
     BoardSummary,
@@ -85,7 +93,13 @@ class CodeCrossState(TypedDict, total=False):
     config: ProjectConfig
     review_plan: ReviewPlan
     code_context: CodeContext
+    code_context_override: CodeContext
     reviewer_results: Annotated[list[ReviewerResult], operator.add]
+    raw_findings: list[Finding]
+    deduplicated_findings: list[Finding]
+    rejected_findings: list[Finding]
+    finding_critic_error: str
+    semantic_dedup_error: str
     findings: list[Finding]
     test_intents: list[TestIntent]
     verifications: dict[str, FindingVerification]
@@ -145,7 +159,16 @@ def context_retriever_node(state: CodeCrossState) -> dict[str, CodeContext]:
     这是 V1.2 的关键节点。它把 Planner 的 changed_files/changed_symbols
     转成真实代码片段，再交给 reviewer。这样 reviewer 不再只看 diff，
     但 Context Retriever 本身不做任何风险判断，避免引入新的审查偏置。
+
+    公开 benchmark 可以提供已经冻结并版本化的上下文。覆盖值必须在 Reviewer
+    fan-out 之前进入 ``code_context``，否则 Reviewer 实际会审查本地工作区，而最终
+    输出又在结束节点被替换成 benchmark 上下文，形成“记录看似正确、模型输入实际
+    错误”的隐蔽评测污染。
     """
+
+    frozen_context = state.get("code_context_override")
+    if frozen_context is not None:
+        return {"code_context": frozen_context}
 
     return {
         "code_context": context_retriever_agent(
@@ -179,10 +202,41 @@ def make_reviewer_node(index: int):
 def initial_board_node(state: CodeCrossState) -> dict[str, Any]:
     """Graph 节点：收集 reviewer 输出并初始化 Review Board。"""
 
-    findings, intents = collect_review_outputs(state.get("reviewer_results", []))
+    raw_findings, intents = collect_review_outputs(state.get("reviewer_results", []))
+    deduplication = deduplicate_findings(
+        raw_findings,
+        preserve_human_concerns=state["config"].review_profile == "human_review_alignment",
+    )
+    semantic_dedup_error = ""
+    if state["config"].semantic_deduplication_enabled and not state["config"].mock_llm:
+        groups, semantic_dedup_error = semantic_deduplication_batch_agent(
+            deduplication.findings,
+            config=state["config"],
+        )
+        deduplication = merge_explicit_finding_groups(deduplication.findings, groups)
+    # canonical 层必须在 Critic 前单独保存。否则评测输出会把“去重效果”和
+    # “事实过滤效果”混成同一层，无法诊断 recall 究竟在哪一步丢失。
+    canonical_findings = deduplication.findings
+    findings, rejected_findings, critic_error = finding_critic_agent(
+        canonical_findings,
+        diff=state["diff"],
+        code_context=state.get("code_context"),
+        config=state["config"],
+    )
+    findings = prioritize_final_findings(
+        findings,
+        limit=state["config"].max_final_findings,
+        balance_reviewers=state["config"].review_profile == "human_review_alignment",
+    )
+    intents = remap_test_intents(intents, deduplication.source_to_canonical)
     verifications = init_finding_verifications(findings)
     evidence_map = init_static_evidence(findings)
     next_state: CodeCrossState = {
+        "raw_findings": raw_findings,
+        "deduplicated_findings": canonical_findings,
+        "rejected_findings": rejected_findings,
+        "finding_critic_error": critic_error,
+        "semantic_dedup_error": semantic_dedup_error,
         "findings": findings,
         "test_intents": intents,
         "verifications": verifications,
@@ -220,9 +274,28 @@ def select_verification_targets_node(state: CodeCrossState) -> dict[str, Any]:
 def route_after_select(state: CodeCrossState) -> str:
     """条件边：有目标就进入测试验证，没有目标就直接评估。"""
 
+    # Reviewer benchmark 不应受本机依赖或生成测试质量影响，因此在这里直接短路。
+    if state["config"].evaluation_mode == "review_only":
+        return "review_only_complete"
     if state.get("verification_targets"):
         return "test_strategy"
     return "evaluator"
+
+
+def review_only_complete_node(state: CodeCrossState) -> dict[str, Any]:
+    """审查能力评测的终点：保留 Board，但不调用证据/报告类模型。
+
+    benchmark 只消费 Finding。继续运行风险 evaluator、高风险复核、报告翻译既不会
+    改善 P/R/F1，又会增加延迟、费用和无关失败，因此在专用模式下明确结束。
+    """
+
+    # frozen context 已在 context_retriever_node 中、Reviewer 调用前生效。终点只负责
+    # 补齐可审计的停止原因和最终 Board，不能再次用上下文覆盖替代这些字段。
+    stop_reason = "review_only_complete"
+    return {
+        "board_summary": _summary_from_state(state, stop_reason=stop_reason),
+        "stop_reason": stop_reason,
+    }
 
 
 def test_strategy_node(state: CodeCrossState) -> dict[str, TestStrategy]:
@@ -520,6 +593,7 @@ def build_graph(config: ProjectConfig):
 
     graph.add_node("initial_board", initial_board_node)
     graph.add_node("select_verification_targets", select_verification_targets_node)
+    graph.add_node("review_only_complete", review_only_complete_node)
     graph.add_node("test_strategy", test_strategy_node)
     graph.add_node("test_case", test_case_node)
     graph.add_node("test_author", test_author_node)
@@ -550,8 +624,13 @@ def build_graph(config: ProjectConfig):
     graph.add_conditional_edges(
         "select_verification_targets",
         route_after_select,
-        {"test_strategy": "test_strategy", "evaluator": "evaluator"},
+        {
+            "test_strategy": "test_strategy",
+            "evaluator": "evaluator",
+            "review_only_complete": "review_only_complete",
+        },
     )
+    graph.add_edge("review_only_complete", END)
     graph.add_edge("test_strategy", "test_case")
     graph.add_edge("test_case", "test_author")
     graph.add_edge("test_author", "executor")
@@ -624,17 +703,20 @@ def run_workflow(
     config: ProjectConfig | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    code_context_override: CodeContext | None = None,
 ) -> CodeCrossState:
     """外部调用入口：传入 diff，返回完整的最终 state。"""
 
     root = Path(project_root or Path.cwd()).resolve()
-    active_config = config or load_project_config(root)
+    active_config = config or load_project_config(root, diff=diff)
     app = build_graph(active_config)
     initial_state = {
         "diff": diff,
         "project_root": str(root),
         "config": active_config,
     }
+    if code_context_override is not None:
+        initial_state["code_context_override"] = code_context_override
 
     # The historical CLI/test path stays on invoke for maximum compatibility.
     if on_event is None and should_cancel is None:

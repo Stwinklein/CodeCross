@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "benchmark": "foundry-ai/swe-prbench",
+  "dataset_version": "swe-prbench-v0.4.1-eval_100",
+  "source_split": "eval_100",
+  "context_config": "config_A",
+  "status": "sealed_not_run",
+  "seed": "codecross-v0.22-holdout-v4-20260713",
+  "selection_policy": "stable_sha256_repository_diverse_without_reading_annotations",
+  "task_ids": [
+    "backstage__32466",
+    "ragas__2331",
+    "espnet__6352",
+    "vitest__9521",
+    "falcon__2581",
+    "pipecat__3392",
+    "agents__4846",
+    "linkding__1261",
+    "prowler__9702",
+    "dask__12144"
+  ],
+  "development_task_ids": [],
+  "sealed_task_ids": [
+    "backstage__32466",
+    "ragas__2331",
+    "espnet__6352",
+    "vitest__9521",
+    "falcon__2581",
+    "pipecat__3392",
+    "agents__4846",
+    "linkding__1261",
+    "prowler__9702",
+    "dask__12144"
+  ],
+  "schema_dev_exclusions": [
+    "prowler__9865"
+  ],
+  "additional_exclusions": [
+    "autogluon__5586",
+    "chia-blockchain__20099",
+    "dask__12221",
+    "deepchem__4601",
+    "kale__593",
+    "kedro__5334",
+    "nessie__11676",
+    "openbao__1906",
+    "pipecat__3598",
+    "pip__13482",
+    "prowler__9606",
+    "qutebrowser__8845",
+    "spyder__24990",
+    "stylelint__8953",
+    "zod__5672"
+  ]
+}

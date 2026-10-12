@@ -6,6 +6,8 @@ langchain-core
 langchain-deepseek
 langchain-anthropic
 langgraph
+langsmith>=0.3.13
+json-repair>=0.61,<0.62
 fastapi
 httpx
 uvicorn

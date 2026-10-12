@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -60,7 +61,7 @@ def to_jsonable(value: Any) -> Any:
     return value
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """定义命令行参数。"""
 
     parser = argparse.ArgumentParser(description="CodeCross V1 multi-model code review runner.")
@@ -76,10 +77,36 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use deterministic local agents instead of calling configured models.",
     )
+    parser.add_argument(
+        "--test-command",
+        help=(
+            "覆盖自动检测出的测试命令，例如 'pnpm exec vitest run'。"
+            "命令会拆成 argv 并以 shell=False 执行，不支持管道、重定向或 &&。"
+        ),
+    )
     parser.add_argument("--demo", action="store_true", help="Run the bundled safe_divide demo.")
     parser.add_argument("--json", action="store_true", help="Print structured JSON instead of Markdown.")
     parser.add_argument("--output", help="Write the report to this file.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def parse_test_command_override(raw_command: str | None) -> list[str] | None:
+    """把 CLI 命令拆成安全 argv，并拒绝 shell 控制符。
+
+    用户覆盖只用于选择已有测试工具，不应该获得额外的 shell 执行能力。
+    `shlex.split` 负责保留引号中的带空格参数，随后 executor 直接把列表传给
+    ``subprocess.run(shell=False)``。显式拒绝控制符还能让错误在启动前就可读。
+    """
+
+    if not raw_command:
+        return None
+    command = shlex.split(raw_command, posix=True)
+    if not command:
+        raise ValueError("--test-command 不能为空")
+    forbidden = {"&&", "||", "|", ">", ">>", "<", ";"}
+    if any(part in forbidden for part in command):
+        raise ValueError("--test-command 不允许 shell 管道、重定向或命令连接符")
+    return command
 
 
 def main() -> None:
@@ -87,8 +114,15 @@ def main() -> None:
 
     args = parse_args()
     project_root = Path(args.project_root).resolve()
-    config = load_project_config(project_root, mock_llm=args.mock_llm)
     diff = read_diff(args, project_root)
+    # 必须先读取 diff 再检测项目：monorepo 中 package.json 与 pyproject.toml 可能共存，
+    # 本次变更文件的后缀才是选择执行器的最高优先级证据。
+    config = load_project_config(
+        project_root,
+        mock_llm=args.mock_llm,
+        diff=diff,
+        test_command_override=parse_test_command_override(args.test_command),
+    )
 
     result = run_workflow(diff, project_root=project_root, config=config)
     # Markdown 适合人看；JSON 适合后续接 Web UI、CI 或其他工具。

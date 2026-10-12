@@ -116,6 +116,36 @@ def test_board_keeps_non_reproducible_failure_inconclusive():
     assert next(iter(evidence_map.values())).evidence_type == "executor_error"
 
 
+def test_board_treats_passing_generated_test_as_not_reproduced():
+    """生成测试通过不是严格反例，不能把真实问题直接标成 refuted。"""
+
+    finding = Finding(
+        finding_id="finding_1",
+        source_reviewer="logic_reviewer",
+        model="deepseek/test",
+        category="runtime",
+        severity="high",
+        file_path="pkg/service.py",
+        problem="A nullable member is dereferenced.",
+        evidence="member can be None before member.id is read.",
+        impact="Runtime AttributeError.",
+        suggestion="Guard the nullable value.",
+    )
+    result = TestResult(
+        test_case_id="test_1",
+        round_index=1,
+        status="passed",
+        related_finding_ids=["finding_1"],
+    )
+
+    verifications, _, changes = update_finding_verifications_from_results(
+        init_finding_verifications([finding]), {}, [result]
+    )
+
+    assert verifications["finding_1"].status == "not_reproduced"
+    assert changes == {"finding_1": "unverified -> not_reproduced"}
+
+
 def test_board_stops_when_round_has_no_verification_progress():
     """验证队列仍有目标但本轮无状态变化时，应提前停止，避免重复空转。"""
 

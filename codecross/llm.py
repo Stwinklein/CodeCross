@@ -8,10 +8,15 @@ call_model_json 统一调用。这样以后换 OpenAI、Qwen、本地模型或 A
 """
 
 import json
-from typing import Any, Iterable, Sequence
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Iterator, Sequence
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from json_repair import repair_json
 from pydantic import BaseModel, ValidationError
 
 from .config import ModelSettings
@@ -21,6 +26,48 @@ class ModelCallError(RuntimeError):
     """模型调用或结构化解析失败时抛出的统一异常。"""
 
     pass
+
+
+@dataclass(slots=True)
+class ModelCallMetrics:
+    """一次 workflow/case 内的模型调用观测值。
+
+    这里统计“真实 provider invoke 尝试”，因此 JSON repair 的第二次请求会再计一次；
+    这正是成本和延迟分析需要看到的数字。API key、Prompt 和响应正文都不会进入指标。
+    """
+
+    call_count: int = 0
+    failure_count: int = 0
+    duration_ms: int = 0
+    calls_by_role: dict[str, int] = field(default_factory=dict)
+
+    def record(self, settings: ModelSettings, *, duration_ms: int, succeeded: bool) -> None:
+        """记录一次调用；角色名比模型名更适合定位是哪一层重试过多。"""
+
+        self.call_count += 1
+        self.duration_ms += max(duration_ms, 0)
+        self.calls_by_role[settings.role] = self.calls_by_role.get(settings.role, 0) + 1
+        if not succeeded:
+            self.failure_count += 1
+
+
+# ContextVar 让并发 LangSmith case 各自拥有独立计数器；普通模块全局整数会把不同
+# 样本的调用数串在一起。默认 None 表示产品普通调用不启用额外观测。
+_MODEL_CALL_METRICS: ContextVar[ModelCallMetrics | None] = ContextVar(
+    "codecross_model_call_metrics", default=None
+)
+
+
+@contextmanager
+def capture_model_call_metrics() -> Iterator[ModelCallMetrics]:
+    """在一个 with 作用域内捕获模型调用次数、失败数和总耗时。"""
+
+    metrics = ModelCallMetrics()
+    token = _MODEL_CALL_METRICS.set(metrics)
+    try:
+        yield metrics
+    finally:
+        _MODEL_CALL_METRICS.reset(token)
 
 
 # Agent 代码里可以用 LangChain message，也可以用轻量 tuple/dict 表示消息。
@@ -147,10 +194,14 @@ def normalize_messages(messages: Sequence[MessageInput]) -> list[BaseMessage]:
 def call_model(settings: ModelSettings, messages: Sequence[MessageInput]) -> str:
     """调用模型并返回文本。"""
 
+    start = time.perf_counter()
+    succeeded = False
     try:
         model = create_chat_model(settings)
         response = model.invoke(normalize_messages(messages))
-        return content_to_text(response.content)
+        text = content_to_text(response.content)
+        succeeded = True
+        return text
     except ModelCallError:
         raise
     except Exception as exc:
@@ -159,6 +210,14 @@ def call_model(settings: ModelSettings, messages: Sequence[MessageInput]) -> str
                 f"{settings.display_name} model call failed: {type(exc).__name__}: {exc}"
             ) from exc
         raise
+    finally:
+        metrics = _MODEL_CALL_METRICS.get()
+        if metrics is not None:
+            metrics.record(
+                settings,
+                duration_ms=int((time.perf_counter() - start) * 1000),
+                succeeded=succeeded,
+            )
 
 
 def _strip_code_fences(text: str) -> str:
@@ -195,9 +254,21 @@ def _extract_json_text(text: str) -> str:
 
 
 def parse_json_model(schema: type[BaseModel], text: str) -> BaseModel:
-    """把模型文本解析并校验为指定 Pydantic schema。"""
+    """把模型文本解析并校验为指定 Pydantic schema。
 
-    data = json.loads(_extract_json_text(text))
+    正常 JSON 始终走标准库，不让 repair 改写合法输出；只有 JSONDecodeError 时才
+    使用成熟的 json-repair 做局部语法恢复，随后仍必须通过同一 Pydantic schema。
+    """
+
+    json_text = _extract_json_text(text)
+    try:
+        data = json.loads(json_text)
+    except json.JSONDecodeError:
+        data = repair_json(
+            json_text,
+            return_objects=True,
+            skip_json_loads=True,
+        )
     return schema.model_validate(data)
 
 
@@ -215,11 +286,12 @@ def call_model_json(
     attempts = max(settings.retry_count + 1, 1)
     last_error: Exception | None = None
     augmented_messages = list(messages)
+    previous_text = ""
 
     for attempt in range(attempts):
         try:
-            text = call_model(settings, augmented_messages)
-            return parse_json_model(schema, text)
+            previous_text = call_model(settings, augmented_messages)
+            return parse_json_model(schema, previous_text)
         except (json.JSONDecodeError, ValidationError, ValueError, ModelCallError) as exc:
             last_error = exc
             if attempt >= attempts - 1 or isinstance(exc, ModelCallError):
@@ -231,7 +303,10 @@ def call_model_json(
                     "The previous response was invalid JSON or did not match the schema. "
                     "Repair it and return JSON only.\n"
                     f"Schema:\n{json.dumps(schema.model_json_schema(), ensure_ascii=False)}\n"
-                    f"Error:\n{exc}",
+                    f"Error:\n{exc}\n"
+                    # schema 错误通常需要模型看到旧输出才能真正修字段；只给 error
+                    # 会让它从头随机生成一次。限制长度避免把超长坏输出再次塞满窗口。
+                    f"Previous response (tail):\n{previous_text[-12000:]}",
                 ),
             ]
 

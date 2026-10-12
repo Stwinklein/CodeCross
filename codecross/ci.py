@@ -344,7 +344,8 @@ def run_ci_review(
 ) -> CodeCrossState:
     """Load config and run the normal CodeCross workflow for CI."""
 
-    config = load_project_config(project_root, mock_llm=mock_llm)
+    # CI checkout 常是多语言 monorepo；diff 后缀应优先于根目录中的任一清单文件。
+    config = load_project_config(project_root, mock_llm=mock_llm, diff=diff)
     if require_models and not mock_llm:
         validate_model_credentials(config)
     return run_workflow(diff, project_root=project_root, config=config)

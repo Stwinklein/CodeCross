@@ -26,6 +26,8 @@ VerificationStatus = Literal[
     "refuted",
     "inconclusive",
     "not_testable",
+    # 测试通过只说明本次没有复现，不等价于存在严格反例。
+    "not_reproduced",
     # Issue #2 第二步：当 pytest 不可用、改走 LLM 交叉验证 Fallback 时，
     # Board 用下面这组状态把“模型交叉验证”的结果与 pytest 证据区分开。
     # 这里特意不复用 supported/refuted：因为它们的证据强度不一样，
@@ -50,6 +52,16 @@ EvidenceType = Literal[
 EvidenceStrength = Literal["weak", "medium", "strong"]
 TestType = Literal[
     "pytest",
+    # 原生执行器类型必须显式区分。不能把 Jest/Go/Cargo 的结果都伪装成 pytest，
+    # 否则 Board、LangSmith 和后续人工排查都无法知道证据究竟由哪个工具产生。
+    "unittest",
+    "jest",
+    "vitest",
+    "go_test",
+    "maven",
+    "gradle",
+    "cargo_test",
+    "rspec",
     "function_call",
     "property_based",
     "static_check",
@@ -77,6 +89,9 @@ TestStatus = Literal[
 ]
 EvidenceKind = Literal[
     "pytest",
+    # 多语言确定性执行器产生的证据。具体框架保存在 TestResult.executor_name，
+    # evidence_kind 只负责区分“真实本地执行”与“LLM 交叉审核”。
+    "native_test",
     "static",
     "llm_cross_verification",
 ]
@@ -86,6 +101,7 @@ CodeContextKind = Literal[
     "symbol_definition",
     "call_site",
     "existing_test",
+    "project_manifest",
     "diagnostic",
 ]
 
@@ -163,6 +179,10 @@ class CodeContext(CodeCrossModel):
     snippets: list[CodeContextSnippet] = Field(default_factory=list)
     missing_files: list[str] = Field(default_factory=list)
     summary_notes: list[str] = Field(default_factory=list)
+    # 某些公开 benchmark 发布的 frozen context 已经内嵌完整 diff。这个标记用于
+    # 防止 Reviewer/Critic prompt 再附加一份 patch，避免重复输入造成注意力稀释。
+    # 本地仓库检索得到的普通 CodeContext 不包含 diff，因此默认保持 False。
+    contains_diff: bool = False
 
 
 class Finding(CodeCrossModel):
@@ -186,6 +206,10 @@ class Finding(CodeCrossModel):
     suggestion: str
     reproduction_hint: str = ""
     related_test_intent_ids: list[str] = Field(default_factory=list)
+    # 去重后 source_reviewer 保留代表项来源，下面三项提供完整 provenance。
+    source_reviewers: list[str] = Field(default_factory=list)
+    merged_finding_ids: list[str] = Field(default_factory=list)
+    fingerprint: str = ""
 
 
 class FindingVerification(CodeCrossModel):
@@ -307,6 +331,10 @@ class TestResult(CodeCrossModel):
     # Issue #2：区分一条 TestResult 是 pytest 跑出来的还是 LLM 交叉验证产出的。
     # 默认 "pytest" 保持向前兼容；只有 cross verification 分支会写入 "llm_cross_verification"。
     evidence_kind: EvidenceKind = "pytest"
+    # 记录真实执行器和 argv，方便 LangSmith/报告解释某条证据如何得到。
+    # 这里只存参数列表，不存 shell 字符串，也不会包含 API key。
+    executor_name: str = "pytest"
+    executor_command: list[str] = Field(default_factory=list)
     # Issue #2：仅当 evidence_kind == "llm_cross_verification" 时填充。
     # 拆出独立 payload 的好处：pytest 字段（exit_code/stdout/stderr）保持纯净，
     # 模型交叉验证的复现步骤、反例、abstain 原因不会污染 pytest 解析逻辑。
@@ -400,6 +428,40 @@ class ReviewerResult(CodeCrossModel):
     test_intents: list[TestIntent] = Field(default_factory=list)
     reviewer_notes: str = ""
     errors: list[str] = Field(default_factory=list)
+
+
+class FindingDuplicateDecision(CodeCrossModel):
+    """语义去重器判断两条候选是否属于同一根因。"""
+
+    same_root_cause: bool = False
+    single_fix_resolves_both: bool = False
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reasoning: str = ""
+
+
+class FindingMergeGroup(CodeCrossModel):
+    """批量语义去重器输出的一组同根因 Finding ID。"""
+
+    finding_ids: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reasoning: str = ""
+
+
+class FindingMergeBatch(CodeCrossModel):
+    groups: list[FindingMergeGroup] = Field(default_factory=list)
+
+
+class FindingCritiqueDecision(CodeCrossModel):
+    """最终候选 Critic 对单条 Finding 的保守裁决。"""
+
+    finding_id: str
+    keep: bool = True
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reasoning: str = ""
+
+
+class FindingCritiqueBatch(CodeCrossModel):
+    decisions: list[FindingCritiqueDecision] = Field(default_factory=list)
 
 
 class TestStrategy(CodeCrossModel):

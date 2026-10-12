@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "benchmark": "foundry-ai/swe-prbench",
+  "source_split": "eval_100",
+  "context_config": "config_C",
+  "status": "fully_opened_all15_development_after_v017_sealed_failure",
+  "dataset_version": "swe-prbench-v0.4.1-eval_100",
+  "seed": "derived_from_v2_after_excluding_first5",
+  "task_ids": [
+    "stylelint__8953",
+    "chia-blockchain__20099",
+    "kedro__5334",
+    "prowler__9606",
+    "deepchem__4601",
+    "pipecat__3598",
+    "nessie__11676",
+    "kale__593",
+    "pip__13482",
+    "autogluon__5586",
+    "qutebrowser__8845",
+    "dask__12221",
+    "openbao__1906",
+    "spyder__24990",
+    "zod__5672"
+  ],
+  "development_task_ids": [
+    "stylelint__8953",
+    "chia-blockchain__20099",
+    "kedro__5334",
+    "prowler__9606",
+    "deepchem__4601",
+    "pipecat__3598",
+    "nessie__11676",
+    "kale__593",
+    "pip__13482",
+    "autogluon__5586",
+    "qutebrowser__8845",
+    "dask__12221",
+    "openbao__1906",
+    "spyder__24990",
+    "zod__5672"
+  ],
+  "sealed_task_ids": [
+  ],
+  "excluded_calibration_manifests": [
+    "evals/swe_prbench_holdout.json",
+    "evals/swe_prbench_holdout_v2.json"
+  ]
+}

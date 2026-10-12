@@ -10,6 +10,49 @@ from pathlib import Path
 from codecross.config import load_project_config
 from codecross.context import retrieve_code_context
 from codecross.schemas import ReviewPlan
+import codecross.context as context_module
+
+
+def test_context_retriever_ignores_codecross_benchmark_cache(tmp_path: Path):
+    """目标项目下的 CodeCross 缓存不能反向污染 Reviewer 上下文。"""
+
+    (tmp_path / "app.py").write_text("def changed():\n    return 1\n", encoding="utf-8")
+    cached = tmp_path / ".codecross" / "benchmark_repositories"
+    cached.mkdir(parents=True)
+    (cached / "foreign.py").write_text(
+        "def consumer():\n    return changed()\n", encoding="utf-8"
+    )
+    config = load_project_config(
+        tmp_path, mock_llm=True, diff="diff --git a/app.py b/app.py\n"
+    )
+    context = retrieve_code_context(
+        diff="diff --git a/app.py b/app.py\n",
+        project_root=tmp_path,
+        review_plan=ReviewPlan(changed_files=["app.py"], changed_symbols=["changed"]),
+        config=config,
+    )
+
+    assert all(".codecross" not in item.file_path for item in context.snippets)
+
+
+def test_context_budget_prioritizes_changed_code_over_large_manifest(monkeypatch, tmp_path: Path):
+    """字符预算不足时必须保留变更代码，优先丢弃低优先级 manifest。"""
+
+    monkeypatch.setattr(context_module, "MAX_CONTEXT_CHARS", 120)
+    (tmp_path / "package.json").write_text("x" * 500, encoding="utf-8")
+    source = tmp_path / "src"; source.mkdir()
+    (source / "small.ts").write_text("export function changed() { return 1; }\n", encoding="utf-8")
+    diff = "diff --git a/src/small.ts b/src/small.ts\n"
+    config = load_project_config(tmp_path, mock_llm=True, diff=diff)
+    result = retrieve_code_context(
+        diff=diff, project_root=tmp_path,
+        review_plan=ReviewPlan(changed_files=["src/small.ts"], changed_symbols=["changed"]),
+        config=config,
+    )
+
+    assert any(item.kind == "changed_file" for item in result.snippets)
+    assert not any(item.kind == "project_manifest" for item in result.snippets)
+    assert any("Context budget kept" in note for note in result.summary_notes)
 
 
 def test_context_retriever_collects_changed_file_symbol_calls_and_tests(tmp_path: Path):
@@ -150,3 +193,68 @@ def test_context_retriever_includes_changed_hunks_for_large_javascript_files(tmp
     kinds = {snippet.kind for snippet in context.snippets}
     assert "changed_hunk" in kinds
     assert "symbol_definition" in kinds
+
+
+def test_context_retriever_collects_go_calls_tests_and_manifest(tmp_path: Path):
+    """Go 项目应获得定义、调用点、测试和 go.mod，而不是只看到 diff。"""
+
+    (tmp_path / "go.mod").write_text("module example.com/demo\n\ngo 1.23\n", encoding="utf-8")
+    source = tmp_path / "service"
+    source.mkdir()
+    (source / "handler.go").write_text(
+        "package service\n\nfunc HandleRequest(id string) error {\n    return nil\n}\n",
+        encoding="utf-8",
+    )
+    (source / "router.go").write_text(
+        "package service\n\nfunc route() error { return HandleRequest(\"x\") }\n",
+        encoding="utf-8",
+    )
+    (source / "handler_test.go").write_text(
+        "package service\n\nfunc TestHandle(t *testing.T) { _ = HandleRequest(\"x\") }\n",
+        encoding="utf-8",
+    )
+    config = load_project_config(
+        tmp_path,
+        mock_llm=True,
+        diff="diff --git a/service/handler.go b/service/handler.go\n",
+    )
+    plan = ReviewPlan(
+        changed_files=["service/handler.go"], changed_symbols=["HandleRequest"]
+    )
+
+    context = retrieve_code_context(
+        diff="diff --git a/service/handler.go b/service/handler.go\n",
+        project_root=tmp_path,
+        review_plan=plan,
+        config=config,
+    )
+
+    snippets = {(item.kind, item.file_path) for item in context.snippets}
+    assert ("project_manifest", "go.mod") in snippets
+    assert ("symbol_definition", "service/handler.go") in snippets
+    assert ("call_site", "service/router.go") in snippets
+    assert ("existing_test", "service/handler_test.go") in snippets
+
+
+def test_context_retriever_collects_ruby_definition_call_and_spec(tmp_path: Path):
+    (tmp_path / "Gemfile").write_text("source 'https://rubygems.org'\n", encoding="utf-8")
+    app = tmp_path / "app"; spec = tmp_path / "spec"
+    app.mkdir(); spec.mkdir()
+    (app / "service.rb").write_text(
+        "class Service\n  def process(value)\n    value.to_s\n  end\nend\n", encoding="utf-8"
+    )
+    (app / "caller.rb").write_text("Service.new.process input\n", encoding="utf-8")
+    (spec / "service_spec.rb").write_text("expect(Service.new.process(nil)).to eq('')\n", encoding="utf-8")
+    diff = "diff --git a/app/service.rb b/app/service.rb\n"
+    config = load_project_config(tmp_path, mock_llm=True, diff=diff)
+    context = retrieve_code_context(
+        diff=diff, project_root=tmp_path,
+        review_plan=ReviewPlan(changed_files=["app/service.rb"], changed_symbols=["process"]),
+        config=config,
+    )
+
+    snippets = {(item.kind, item.file_path) for item in context.snippets}
+    assert ("project_manifest", "Gemfile") in snippets
+    assert ("symbol_definition", "app/service.rb") in snippets
+    assert ("call_site", "app/caller.rb") in snippets
+    assert ("existing_test", "spec/service_spec.rb") in snippets

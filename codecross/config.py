@@ -9,8 +9,11 @@ V1 暂时不引入 YAML/TOML 配置文件，而是用 dataclass + .env 组合。
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
+
+from .project_detection import detect_project
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -65,7 +68,7 @@ class ModelSettings:
 
 @dataclass(slots=True)
 class RunnerConfig:
-    """Evidence Verification Loop 和 pytest executor 的安全/预算配置。"""
+    """Evidence Verification Loop 和多语言 executor 的安全/预算配置。"""
 
     max_verification_rounds: int = 3
     max_tests_per_round: int = 8
@@ -73,6 +76,10 @@ class RunnerConfig:
     allow_network: bool = False
     allow_write_outside_project: bool = False
     fail_open: bool = True
+    # 用户显式覆盖测试命令时保存已经拆分好的 argv。
+    # executor 始终使用 subprocess.run(..., shell=False)，因此这里不能保存
+    # `npm test && curl ...` 之类的 shell 表达式；CLI 会在进入配置前完成安全拆分。
+    test_command_override: list[str] | None = None
     blocked_commands: list[str] = field(
         default_factory=lambda: [
             "curl",
@@ -105,7 +112,21 @@ class ProjectConfig:
     source_roots: list[str] = field(default_factory=lambda: ["."])
     test_roots: list[str] = field(default_factory=lambda: ["tests"])
     entry_points: list[str] = field(default_factory=list)
+    # ProjectDetector 给出的结构化 argv。allowed_commands 暂时保留字符串形式，
+    # 兼容已有报告/API；真正执行必须使用本字段，避免运行时再次猜测如何分词。
+    test_command: list[str] = field(default_factory=lambda: ["python", "-m", "pytest"])
     allowed_commands: list[str] = field(default_factory=lambda: ["python -m pytest"])
+    # 两种模式共用 Planner、上下文和 Reviewer；review_only 只跳过后置证据环。
+    evaluation_mode: Literal["review_only", "evidence_verification"] = "evidence_verification"
+    detection_confidence: str = "low"
+    detection_evidence: list[str] = field(default_factory=list)
+    semantic_deduplication_enabled: bool = False
+    finding_critic_enabled: bool = False
+    max_final_findings: int = 5
+    # Prompt 版本进入每次评测输出和 LangSmith metadata。修改 Prompt 时必须显式
+    # 提升该值，避免两个行为不同的实验在平台上显示成同一版本。
+    prompt_version: str = "v0.25"
+    review_profile: Literal["defect_detection", "human_review_alignment"] = "defect_detection"
     model_config: dict[str, ModelSettings] = field(default_factory=dict)
     reviewers: list[ModelSettings] = field(default_factory=list)
     runner_config: RunnerConfig = field(default_factory=RunnerConfig)
@@ -131,6 +152,11 @@ def load_project_config(
     project_root: str | Path | None = None,
     *,
     mock_llm: bool = False,
+    diff: str = "",
+    evaluation_mode: Literal["review_only", "evidence_verification"] = "evidence_verification",
+    semantic_deduplication: bool | None = None,
+    review_profile: Literal["defect_detection", "human_review_alignment"] = "defect_detection",
+    test_command_override: list[str] | None = None,
 ) -> ProjectConfig:
     """构造 V1 默认配置。
 
@@ -141,9 +167,12 @@ def load_project_config(
 
     root = Path(project_root).resolve() if project_root else PROJECT_ROOT
     _load_env(root, override=project_root is not None)
+    profile = detect_project(root, diff=diff)
 
     deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
     anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+    # 公开 benchmark 需要可复现的版本比较；产品交互保留少量温度以增加探索面。
+    reviewer_temperature = 0.0 if review_profile == "human_review_alignment" else 0.2
     report_localizer_provider = os.getenv(
         "CODECROSS_REPORT_LOCALIZER_PROVIDER", "deepseek"
     ).strip().lower()
@@ -160,23 +189,44 @@ def load_project_config(
         "DEEPSEEK_BASE_URL" if report_localizer_provider == "deepseek" else "ANTHROPIC_BASE_URL",
     )
 
+    # 产品默认保留 DeepSeek + Anthropic 的跨模型互补；公开 human-alignment 评测更关注
+    # Reviewer 能力上限，默认让 correctness pass 也使用已验证的 Anthropic 模型，但仍
+    # 使用独立 Prompt/独立调用。可通过环境变量切回 deepseek，便于做成本与消融对照。
+    human_primary_provider = os.getenv(
+        "CODECROSS_HUMAN_ALIGNMENT_PRIMARY_PROVIDER", "anthropic"
+    ).strip().lower()
+    if human_primary_provider not in {"anthropic", "deepseek"}:
+        human_primary_provider = "anthropic"
+    primary_uses_anthropic = (
+        review_profile == "human_review_alignment"
+        and human_primary_provider == "anthropic"
+    )
     deepseek = ModelSettings(
-        role="deepseek_reviewer",
+        role="anthropic_logic_reviewer" if primary_uses_anthropic else "deepseek_reviewer",
         name="logic_reviewer",
-        provider="deepseek",
-        model=deepseek_model,
+        provider="anthropic" if primary_uses_anthropic else "deepseek",
+        model=anthropic_model if primary_uses_anthropic else deepseek_model,
         focus="logic, boundary conditions, runtime exceptions, maintainability",
-        temperature=0.2,
-        api_key_env="DEEPSEEK_API_KEY",
-        base_url_env="DEEPSEEK_BASE_URL",
+        temperature=reviewer_temperature,
+        timeout_seconds=120,
+        retry_count=2,
+        api_key_env="ANTHROPIC_API_KEY" if primary_uses_anthropic else "DEEPSEEK_API_KEY",
+        base_url_env="ANTHROPIC_BASE_URL" if primary_uses_anthropic else "DEEPSEEK_BASE_URL",
     )
     second = ModelSettings(
         role="second_reviewer",
         name="security_maintainability_reviewer",
         provider="anthropic",
         model=anthropic_model,
-        focus="security, API design, failure modes, missing tests",
-        temperature=0.2,
+        # 第二路不再重复第一路的 bug hunt，而是承担维护者视角。双 Reviewer 只有
+        # 真正覆盖不同关注面，交叉审核才可能提升召回而不是生成两份同义评论。
+        focus=(
+            "repository conventions, API and option naming, PR scope, documentation and release "
+            "wording, test organization, UI/UX regressions, and maintainability"
+        ),
+        temperature=reviewer_temperature,
+        timeout_seconds=120,
+        retry_count=2,
         api_key_env="ANTHROPIC_API_KEY",
         base_url_env="ANTHROPIC_BASE_URL",
     )
@@ -280,8 +330,59 @@ def load_project_config(
         api_key_env="ANTHROPIC_API_KEY",
         base_url_env="ANTHROPIC_BASE_URL",
     )
+    finding_deduplicator = ModelSettings(
+        role="finding_deduplicator",
+        provider="anthropic",
+        model=anthropic_model,
+        temperature=0.0,
+        max_tokens=1200,
+        api_key_env="ANTHROPIC_API_KEY",
+        base_url_env="ANTHROPIC_BASE_URL",
+    )
+    finding_critic = ModelSettings(
+        role="finding_critic",
+        provider="anthropic",
+        model=anthropic_model,
+        temperature=0.0,
+        max_tokens=4000,
+        api_key_env="ANTHROPIC_API_KEY",
+        base_url_env="ANTHROPIC_BASE_URL",
+    )
 
     return ProjectConfig(
+        language=profile.language,
+        test_framework=profile.test_framework,
+        package_manager=profile.package_manager,
+        source_roots=profile.source_roots,
+        test_roots=profile.test_roots,
+        test_command=list(profile.test_command),
+        allowed_commands=[" ".join(profile.test_command)] if profile.test_command else [],
+        evaluation_mode=evaluation_mode,
+        detection_confidence=profile.confidence,
+        detection_evidence=profile.evidence,
+        semantic_deduplication_enabled=(
+            # human-alignment 保留不同 Reviewer 的具体措辞与抽象层级，交给官方
+            # one-to-one Judge 判断；语义聚类曾把近似 human concern 合并进高严重度
+            # 推测，造成不可逆 recall 损失。产品 defect 模式仍保留语义去重。
+            evaluation_mode == "review_only" and review_profile == "defect_detection"
+            if semantic_deduplication is None
+            else semantic_deduplication
+        ),
+        # 产品 defect 模式需要 Critic 压制事实错误；SWE human-alignment 协议则由
+        # 官方 CONFIRMED/PLAUSIBLE/FABRICATED Judge 计 FPR。若两边都过滤，会在
+        # 评分前静默删除可命中的人类 concern，造成不可审计的 recall 损失。
+        finding_critic_enabled=(
+            evaluation_mode == "review_only" and review_profile == "defect_detection"
+        ),
+        review_profile=review_profile,
+        max_final_findings=6 if review_profile == "human_review_alignment" else 5,
+        prompt_version=os.getenv("CODECROSS_PROMPT_VERSION", "v0.25"),
+        runner_config=RunnerConfig(
+            # 复制 argv，防止调用方后续修改原 list 时悄悄改变正在运行的配置。
+            test_command_override=(
+                list(test_command_override) if test_command_override else None
+            )
+        ),
         reviewers=[deepseek, second],
         model_config={
             "planner": planner,
@@ -295,6 +396,8 @@ def load_project_config(
             "high_risk_reviewer": high_risk,
             "report_localizer": report_localizer,
             "repro_agent": repro_agent,
+            "finding_deduplicator": finding_deduplicator,
+            "finding_critic": finding_critic,
         },
         mock_llm=mock_llm,
     )

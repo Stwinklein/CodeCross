@@ -11,19 +11,24 @@ import json
 import re
 from pathlib import Path
 from dataclasses import dataclass, field
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .a2a import call_a2a_reviewer
 from .board import render_board_markdown
 from .config import ModelSettings, ProjectConfig
 from .context import retrieve_code_context
 from .llm import ModelCallError, call_model_json, json_schema_instruction
+from .native_executor import native_test_type_for_project
 from .schemas import (
     BoardSummary,
     CodeContext,
     EvaluatorReport,
     Finding,
+    FindingCritiqueBatch,
+    FindingDuplicateDecision,
+    FindingMergeBatch,
     HighRiskReviewReport,
     LineRange,
     LocalizedFindingCell,
@@ -48,6 +53,237 @@ def _json(data: object) -> str:
     if isinstance(data, BaseModel):
         return data.model_dump_json(indent=2)
     return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+
+
+class BenchmarkReviewComment(BaseModel):
+    """human-alignment 模式的轻量评论，字段与官方 agent contract 对齐。"""
+
+    body: str
+    file: str | None = None
+    line: int | None = None
+    severity: Literal["P0", "P1", "P2"] = "P2"
+
+
+class BenchmarkReviewBatch(BaseModel):
+    """避免完整 ReviewerResult schema 抢占 frozen context 的注意力预算。"""
+
+    comments: list[BenchmarkReviewComment] = Field(default_factory=list)
+
+
+def _review_profile_policy(config: ProjectConfig) -> str:
+    """把不同 benchmark/产品目标的审查边界显式写入 Prompt，避免口径混用。"""
+
+    if config.review_profile == "human_review_alignment":
+        return (
+            " Also report concrete, actionable human-review concerns about resource lifecycle, "
+            "API idioms, maintainability, operational/release reliability, test/fixture correctness, "
+            "and inefficient or brittle implementations. These must cite specific changed code and "
+            "a clear improvement; vague taste or formatting preferences are still excluded."
+        )
+    return (
+        " Do not report style preferences, generic missing-tests comments, or speculative risks "
+        "without a concrete failure trigger."
+    )
+
+
+def _critic_profile_policy(config: ProjectConfig) -> str:
+    if config.review_profile == "human_review_alignment":
+        return (
+            "Concrete resource cleanup, API-idiom, maintainability, operational, release, and test "
+            "fixture concerns are in scope; do not reject them merely because behavior still works. "
+        )
+    return "Generic style or best-practice advice without a failure trigger is out of scope. "
+
+
+def _diff_prompt_section(diff: str, code_context: CodeContext | None) -> str:
+    """按上下文契约渲染 diff，避免 benchmark frozen context 重复携带 patch。
+
+    Planner 和项目检测仍然可以读取原始 diff；这里只控制真正发给 Reviewer/Critic
+    的文本。当 `contains_diff=True` 时，上下文中已经有版本化 patch，因此用明确的
+    占位说明替代第二份原文，既减少 token，也方便从 trace 审计输入口径。
+    """
+
+    if code_context is not None and code_context.contains_diff:
+        return "[The versioned repository context above already contains the complete commit diff.]"
+    return diff
+
+
+def _reviewer_prompt_messages(
+    *,
+    reviewer: ModelSettings,
+    diff: str,
+    review_plan: ReviewPlan,
+    config: ProjectConfig,
+    code_context: CodeContext | None,
+) -> list[tuple[str, str]]:
+    """按评测/产品场景构造 Reviewer 消息。
+
+    SWE-PRBench 官方 frozen context 已经把 task focus、summary、diff 和元数据组织成
+    一段约 2k token 的输入。如果再包一层 CodeContext JSON、review plan 和 diff
+    metadata，会重复信息并稀释注意力。因此 human alignment 模式直接传递官方渲染
+    文本；正常仓库审查仍使用下方信息更完整的 repository-level Prompt。
+    """
+
+    if (
+        config.review_profile == "human_review_alignment"
+        and code_context is not None
+        and code_context.contains_diff
+    ):
+        rendered_context = "\n\n".join(
+            snippet.content for snippet in code_context.snippets if snippet.content.strip()
+        )
+        return [
+            (
+                "system",
+                # 与 SWE-PRBench v0.4.1 官方 agent prompt 对齐。这里没有 human golden，
+                # 只是冻结“被测 reviewer 收到什么任务”，以便和公开 baseline 比较。
+                "You are an expert code reviewer. Review the pull request and identify real issues.\n\n"
+                "Rules:\n"
+                "1. Every issue must trace to a specific line in the diff or provided code.\n"
+                "2. Do not invent behavior not visible in the code.\n"
+                "3. Do not flag issues in files you have not been shown.\n"
+                "4. Do not repeat the same concern in different words.\n\n"
+                "Severity:\n"
+                "- P0: production bug, data loss, or security issue\n"
+                "- P1: clear issue that should be fixed before merge\n"
+                "- P2: credible risk worth raising\n\n"
+                "What to look for:\n"
+                "Correctness bugs, missing error handling, edge cases, integration breakage, "
+                "unhandled failures, performance issues in hot paths, broken contracts with callers.\n\n"
+                f"Independent reviewer focus:\n{_benchmark_reviewer_focus(reviewer)}\n\n"
+                "Aim for 4-6 distinct issues. Return an empty comments list if nothing real should be flagged.",
+            ),
+            (
+                "user",
+                f"{rendered_context}\n\n"
+                f"{json_schema_instruction(BenchmarkReviewBatch)}",
+            ),
+        ]
+
+    return [
+        (
+            "system",
+            "You are an independent senior repository-level code reviewer. "
+            "Find actionable correctness, security, reliability, data-integrity, "
+            "compatibility, and material performance regressions introduced by the diff. "
+            "Use repository context to verify definitions, callers, API contracts, null/error "
+            "paths, permissions, concurrency, and existing tests before making a claim. For "
+            "cache/decorator/provider wrappers, distinguish calls to the delegate from calls "
+            "that re-enter the same wrapper through a session/container and trace possible "
+            "recursion. Review changed test code as executable production-quality code: verify "
+            "fixture setup/cleanup identifiers, aliases, awaits, and assertions are consistent. "
+            "Report each root cause exactly once. Do not report pre-existing "
+            "issues unrelated to the change. If evidence is insufficient, abstain instead of "
+            "guessing. When the same root-cause pattern occurs in several files, create one "
+            "Finding with a primary file_path and list every affected path in evidence instead "
+            "of repeating the Finding. Never assume access to benchmark goldens or other "
+            "reviewers' conclusions."
+            + _review_profile_policy(config),
+        ),
+        (
+            "user",
+            f"Reviewer name: {reviewer.display_name}\n"
+            f"Model: {reviewer.provider}/{reviewer.model}\n"
+            f"Focus: {reviewer.focus}\n\n"
+            f"Detected project: language={config.language}, "
+            f"test_framework={config.test_framework}, package_manager={config.package_manager}, "
+            f"detection_confidence={config.detection_confidence}\n\n"
+            f"Review plan:\n{review_plan.model_dump_json(indent=2)}\n\n"
+            f"Objective diff metadata:\n{_json(parse_diff_context_notes(diff))}\n\n"
+            f"Code context retrieved from local project:\n"
+            f"{code_context.model_dump_json(indent=2) if code_context else 'none'}\n\n"
+            f"Commit diff:\n{_diff_prompt_section(diff, code_context)}\n\n"
+            "Output rules for every Finding:\n"
+            "1. problem states one root cause and the concrete trigger condition.\n"
+            "2. evidence cites exact changed/context code and a repository-relative path/line.\n"
+            "3. impact states the observable failure, affected caller/user/data, and severity.\n"
+            "4. suggestion gives the smallest safe fix direction, without inventing APIs.\n"
+            "5. confidence reflects evidence completeness; omit the Finding when confidence is low.\n"
+            "6. test_intents must target behavior, not merely assert source text, when executable.\n\n"
+            f"{json_schema_instruction(ReviewerResult)}",
+        ),
+    ]
+
+
+def _uses_lightweight_benchmark_contract(
+    config: ProjectConfig, code_context: CodeContext | None
+) -> bool:
+    """只有带官方 frozen diff 的 human profile 才使用轻量协议。"""
+
+    return bool(
+        config.review_profile == "human_review_alignment"
+        and code_context is not None
+        and code_context.contains_diff
+    )
+
+
+def _benchmark_reviewer_focus(reviewer: ModelSettings) -> str:
+    """把双 Reviewer 的职责差异提升为明确指令，而不是只附一个关键词标签。"""
+
+    focus = reviewer.focus.strip() or "correctness and integration behavior"
+    if "repository conventions" in focus.lower() or "pr scope" in focus.lower():
+        return (
+            "This is the maintainer-fidelity pass. Before writing comments, silently enumerate every "
+            "shown changed file and hunk; do not let the largest source file consume the whole pass. "
+            "Inspect tests, documentation, configuration, UI, scripts, and release metadata as "
+            "first-class review targets. Allocate the limited comments across distinct concern types: "
+            "(a) option/API naming, defaults matching documentation and implementation, and repository "
+            "conventions; (b) tests, fixtures, signal/"
+            "event assertions, and whether a test proves the intended transition; (c) PR scope, "
+            "comments/docs/release wording, and brittle inline UI layout code. Specific nits and focused "
+            "design questions are allowed when they imply a concrete code change. Prefer an observable "
+            "maintainer concern over a speculative runtime failure, and do not repeat the correctness pass."
+        )
+    return (
+        f"This is the correctness pass. Focus on {focus}. Silently trace each changed branch and "
+        "compare added behavior with adjacent unchanged behavior before selecting comments. Report "
+        "only concrete failures, contract breaks, edge cases, or missing error handling. Do not infer "
+        "a supported platform/version or external API contract unless the shown context establishes it."
+    )
+
+
+def _benchmark_batch_to_reviewer_result(
+    batch: BenchmarkReviewBatch, reviewer: ModelSettings
+) -> ReviewerResult:
+    """把公开 benchmark 的短评论确定性映射回 CodeCross 内部 Finding。
+
+    映射不补充新的技术事实：problem 保留原 body，evidence 只记录模型给出的路径/
+    行号。这样内部 Board 可继续去重和排序，同时不会在模型输出后凭空扩写问题。
+    """
+
+    severity_map = {"P0": "critical", "P1": "high", "P2": "medium"}
+    findings = []
+    for comment in batch.comments[:30]:
+        body = comment.body.strip()
+        if not body:
+            continue
+        location = comment.file or "general"
+        if comment.line is not None:
+            location = f"{location}:{comment.line}"
+        findings.append(
+            Finding(
+                source_reviewer=reviewer.display_name,
+                model=f"{reviewer.provider}/{reviewer.model}",
+                category="human_review",
+                severity=severity_map[comment.severity],  # type: ignore[arg-type]
+                confidence="high",
+                file_path=comment.file or "",
+                line_range=LineRange(
+                    start=comment.line or 1,
+                    end=comment.line or 1,
+                ),
+                problem=body,
+                evidence=f"Model-referenced location: {location}",
+                impact="Actionable pull-request review concern.",
+                suggestion="Address the concrete concern described in the review comment.",
+            )
+        )
+    return ReviewerResult(
+        reviewer_name=reviewer.display_name,
+        model=f"{reviewer.provider}/{reviewer.model}",
+        findings=findings,
+        reviewer_notes="Lightweight SWE-PRBench-compatible review contract.",
+    )
 
 
 @dataclass(slots=True)
@@ -168,6 +404,14 @@ def _extract_symbol_names_from_text(text: str) -> list[str]:
             r"\b(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
             r"(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)"
         ),
+        # Go：普通函数和带 receiver 的方法。
+        r"\bfunc\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        # Rust：支持 pub / pub(crate) / async / unsafe 的常见组合。
+        r"\b(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        # Java/Kotlin：只接受带访问级别的方法，避免把 if/for 等控制语句当符号。
+        r"\b(?:public|protected|private)\s+(?:static\s+|final\s+|synchronized\s+)*[\w<>,?\[\].]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        # Ruby 方法允许省略参数括号，self.foo 取最终方法名。
+        r"\bdef\s+(?:self\.)?([A-Za-z_][A-Za-z0-9_!?=]*)\s*(?:\(|$)",
     ]
     names: list[str] = []
     for pattern in patterns:
@@ -251,7 +495,9 @@ def _infer_risk_areas(diff: str) -> list[str]:
 def planner_agent(diff: str, config: ProjectConfig) -> ReviewPlan:
     """Planner：根据 diff 生成 ReviewPlan。"""
 
-    if config.mock_llm:
+    # review_only 的 Planner 只需要客观 changed_files/symbols；LLM 计划不会进入评分，
+    # 却会增加一次网络失败面。确定性 parser 更快、可复现，也避免隐式提示 Reviewer。
+    if config.mock_llm or config.evaluation_mode == "review_only":
         return _mock_planner(diff)
 
     settings = config.model_config["planner"]
@@ -354,30 +600,18 @@ def reviewer_agent(
         if config.mock_llm:
             return _mock_reviewer(reviewer, diff, code_context)
 
-        result = call_model_json(
-            reviewer,
-            [
-                (
-                    "system",
-                    "You are an independent CodeCross reviewer. "
-                    "Do not assume other reviewers' conclusions. "
-                    "Return findings and test intents only.",
-                ),
-                (
-                    "user",
-                    f"Reviewer name: {reviewer.display_name}\n"
-                    f"Model: {reviewer.provider}/{reviewer.model}\n"
-                    f"Focus: {reviewer.focus}\n\n"
-                    f"Review plan:\n{review_plan.model_dump_json(indent=2)}\n\n"
-                    f"Objective diff metadata:\n{_json(parse_diff_context_notes(diff))}\n\n"
-                    f"Code context retrieved from local project:\n"
-                    f"{code_context.model_dump_json(indent=2) if code_context else 'none'}\n\n"
-                    f"Commit diff:\n{diff}\n\n"
-                    f"{json_schema_instruction(ReviewerResult)}",
-                ),
-            ],
-            ReviewerResult,
+        messages = _reviewer_prompt_messages(
+            reviewer=reviewer,
+            diff=diff,
+            review_plan=review_plan,
+            config=config,
+            code_context=code_context,
         )
+        if _uses_lightweight_benchmark_contract(config, code_context):
+            batch = call_model_json(reviewer, messages, BenchmarkReviewBatch)
+            result = _benchmark_batch_to_reviewer_result(batch, reviewer)  # type: ignore[arg-type]
+        else:
+            result = call_model_json(reviewer, messages, ReviewerResult)
         return _normalize_reviewer_result(result, reviewer)  # type: ignore[arg-type]
     except ModelCallError as exc:
         # reviewer 节点允许单个模型失败后继续整体 workflow。
@@ -403,6 +637,214 @@ def _normalize_reviewer_result(result: ReviewerResult, reviewer: ModelSettings) 
     for intent in result.test_intents:
         intent.source_reviewer = reviewer.display_name
     return result
+
+
+def semantic_duplicate_agent(
+    left: Finding,
+    right: Finding,
+    *,
+    config: ProjectConfig,
+) -> bool:
+    """判断两个 Reviewer 候选是否是同一根因；失败时保守返回不合并。"""
+
+    if config.mock_llm:
+        return False
+    settings = config.model_config["finding_deduplicator"]
+    try:
+        decision = call_model_json(
+            settings,
+            [
+                (
+                    "system",
+                    "You deduplicate code-review findings without seeing any benchmark goldens. "
+                    "Return same_root_cause=true only when both comments describe the same defect "
+                    "and one concrete code fix would resolve both. Similar impact or category alone "
+                    "is not enough.",
+                ),
+                (
+                    "user",
+                    f"Finding A:\n{left.model_dump_json(indent=2)}\n\n"
+                    f"Finding B:\n{right.model_dump_json(indent=2)}\n\n"
+                    f"{json_schema_instruction(FindingDuplicateDecision)}",
+                ),
+            ],
+            FindingDuplicateDecision,
+        )
+    except ModelCallError:
+        return False
+    return bool(
+        decision.same_root_cause
+        and decision.single_fix_resolves_both
+        and decision.confidence >= 0.75
+    )
+
+
+def semantic_deduplication_batch_agent(
+    findings: list[Finding], *, config: ProjectConfig
+) -> tuple[list[list[str]], str]:
+    """一次模型调用聚类全部 canonical candidates，替代 O(n²) pair 调用。"""
+
+    if len(findings) < 2 or config.mock_llm:
+        return [], ""
+    settings = config.model_config["finding_deduplicator"]
+    try:
+        batch = call_model_json(
+            settings,
+            [
+                (
+                    "system",
+                    "Cluster duplicate code-review findings without seeing benchmark goldens. "
+                    "Put findings in one group only when they describe the same root cause and one "
+                    "fix strategy resolves all occurrences. Repeated instances of the same defect "
+                    "across files should be grouped. Similar impact/category alone is insufficient. "
+                    "Omit singletons and uncertain groups.",
+                ),
+                (
+                    "user",
+                    f"Findings:\n{_json(findings)}\n\n"
+                    f"{json_schema_instruction(FindingMergeBatch)}",
+                ),
+            ],
+            FindingMergeBatch,
+        )
+    except ModelCallError as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+    groups = [
+        item.finding_ids
+        for item in batch.groups
+        if item.confidence >= 0.75 and len(item.finding_ids) >= 2
+    ]
+    return groups, ""
+
+
+def finding_critic_agent(
+    findings: list[Finding],
+    *,
+    diff: str,
+    code_context: CodeContext | None,
+    config: ProjectConfig,
+) -> tuple[list[Finding], list[Finding], str]:
+    """对 canonical 候选做一次保守事实核查，返回保留项、拒绝项和错误文本。
+
+    Critic 只允许以高置信度删除候选。调用失败、漏返回 ID 或低置信裁决一律保留，
+    从而避免一个辅助模型故障把 Reviewer 的 Recall 静默清零。
+    """
+
+    if not findings or config.mock_llm or not config.finding_critic_enabled:
+        return findings, [], ""
+    settings = config.model_config["finding_critic"]
+    try:
+        batch = call_model_json(
+            settings,
+            [
+                (
+                    "system",
+                    "You are the final factual critic for code-review candidates. You never see "
+                    "benchmark goldens. Reject a candidate when it is contradicted by supplied code, "
+                    "not introduced by the diff, or mistakes an "
+                    "existing guard/optional access for a crash. Keep a candidate when it cites a "
+                    "specific changed path and a credible concrete trigger, even if frozen context is "
+                    "not sufficient to execute the whole repository. Trace actual values and callers "
+                    "before deciding nullability, async, authorization, and API-contract claims. "
+                    + _critic_profile_policy(config)
+                    + "Return one decision for every finding_id.",
+                ),
+                (
+                    "user",
+                    f"Detected language: {config.language}\n\n"
+                    f"Candidates:\n{_json(findings)}\n\n"
+                    f"Repository context:\n{_json(code_context) if code_context else 'none'}\n\n"
+                    f"Commit diff:\n{_diff_prompt_section(diff, code_context)}\n\n"
+                    f"{json_schema_instruction(FindingCritiqueBatch)}",
+                ),
+            ],
+            FindingCritiqueBatch,
+        )
+    except ModelCallError as exc:
+        return findings, [], f"{type(exc).__name__}: {exc}"
+
+    decisions = {item.finding_id: item for item in batch.decisions}
+    kept: list[Finding] = []
+    rejected: list[Finding] = []
+    for finding in findings:
+        decision = decisions.get(finding.finding_id)
+        if decision and not decision.keep and decision.confidence >= 0.75:
+            rejected.append(finding)
+        else:
+            kept.append(finding)
+    return kept, rejected, ""
+
+
+def prioritize_final_findings(
+    findings: list[Finding], *, limit: int, balance_reviewers: bool = False
+) -> list[Finding]:
+    """选出有限的高价值评论，并可为交叉 Reviewer 保留公平配额。
+
+    defect 模式继续把共识/置信度/严重度作为主排序；human-alignment 模式还需防止
+    一路模型或同一代码位置的多个近义推测占满 Top-K。均衡算法每轮依次偏好尚未覆盖
+    的位置、文件和 Reviewer，再用原质量排序打破平局。它只使用候选自身的客观元数据，
+    不读取 benchmark golden，因此既能提高审查面覆盖，也不会造成评测泄露。
+    """
+
+    if limit <= 0 or len(findings) <= limit:
+        return findings
+    confidence_rank = {"low": 0, "medium": 1, "high": 2}
+    severity_rank = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+    ranked = sorted(
+        findings,
+        key=lambda item: (
+            -len(item.source_reviewers or [item.source_reviewer]),
+            -confidence_rank.get(item.confidence, 0),
+            -severity_rank.get(item.severity, 0),
+            item.file_path,
+            item.finding_id,
+        ),
+    )
+    if not balance_reviewers:
+        return ranked[:limit]
+
+    selected: list[Finding] = []
+    remaining = list(ranked)
+    source_counts: dict[str, int] = {}
+    file_counts: dict[str, int] = {}
+    rank_positions = {item.finding_id: index for index, item in enumerate(ranked)}
+    while remaining and len(selected) < limit:
+        def selection_key(item: Finding) -> tuple[int, int, int, int, int]:
+            sources = item.source_reviewers or [item.source_reviewer]
+            least_represented = min(source_counts.get(source, 0) for source in sources)
+            normalised_file = item.file_path.strip().replace("\\", "/").lower()
+
+            # 同一文件相邻四行通常是同一个表达式/调用点。即使词面没有达到确定性
+            # 去重阈值，也应先给其它位置机会；这里只改变 Top-K 顺序，不删除原候选。
+            nearby_count = 0
+            item_start = item.line_range.start
+            for chosen in selected:
+                chosen_file = chosen.file_path.strip().replace("\\", "/").lower()
+                chosen_start = chosen.line_range.start
+                if (
+                    normalised_file
+                    and normalised_file == chosen_file
+                    and item_start is not None
+                    and chosen_start is not None
+                    and abs(item_start - chosen_start) <= 4
+                ):
+                    nearby_count += 1
+            return (
+                nearby_count,
+                file_counts.get(normalised_file, 0),
+                least_represented,
+                -len(sources),
+                rank_positions[item.finding_id],
+            )
+
+        candidate = min(remaining, key=selection_key)
+        remaining.remove(candidate)
+        selected.append(candidate)
+        normalised_file = candidate.file_path.strip().replace("\\", "/").lower()
+        file_counts[normalised_file] = file_counts.get(normalised_file, 0) + 1
+        for source in candidate.source_reviewers or [candidate.source_reviewer]:
+            source_counts[source] = source_counts.get(source, 0) + 1
+    return selected
 
 
 def _mock_reviewer(
@@ -498,20 +940,10 @@ def _mock_reviewer(
                 )
             )
         else:
-            findings.append(
-                Finding(
-                    source_reviewer=reviewer.display_name,
-                    model=model,
-                    category="maintainability",
-                    severity="low",
-                    confidence="medium",
-                    file_path=target_file,
-                    problem="No clear security issue found in the bounded diff context.",
-                    evidence="The reviewer did not find command execution, network, or secret changes.",
-                    impact="Residual risk remains because V1 does not inspect the full repository.",
-                    suggestion="Run the generated tests and keep manual review for public APIs.",
-                )
-            )
+            # “没有发现问题”不是 Finding。旧 mock 会把这句话伪装成 low finding，
+            # 导致干净 PR 在 precision 评测里被算成假阳性，也会让前端误以为真的有
+            # 一条需要处理的评论。保持 findings=[] 才符合真实 reviewer 的语义。
+            pass
 
     return ReviewerResult(
         reviewer_name=reviewer.display_name,
@@ -593,18 +1025,32 @@ def test_case_agent(
         return _normalize_test_batch(_mock_test_cases(round_index, targets, test_intents), round_index)
 
     settings = config.model_config["test_case_agent"]
+    native_test_type = native_test_type_for_project(config)
+    if native_test_type:
+        # 把 detector 的确定性结论直接告诉生成器，避免模型根据文件名再次猜框架。
+        # test_code 必须是该框架的完整测试文件；executor 会负责临时文件位置和命令。
+        execution_instruction = (
+            f"Generate native {config.test_framework} tests and set test_type to "
+            f"'{native_test_type}'. The test_code must be a complete test file accepted by "
+            f"{config.test_framework}."
+        )
+    else:
+        execution_instruction = (
+            "Generate safe pytest tests only. For a non-Python target without a supported native "
+            "adapter, use a concrete static_check or put the finding in skipped_targets."
+        )
     try:
         batch = call_model_json(
             settings,
             [
                 (
                     "system",
-                    "You are the CodeCross Test Case Agent. Generate safe pytest tests only. "
+                    "You are the CodeCross Test Case Agent. "
+                    f"{execution_instruction} "
                     "Do not use network, subprocess, filesystem mutation, eval, or exec. "
                     "Never emit placeholder tests, pass-only tests, or `assert True` tests. "
-                    "If a target is JavaScript/TypeScript/Vue, do not import it as a Python module; "
-                    "either write a concrete static pytest that reads the source file and asserts "
-                    "specific text/structure, or put the finding in skipped_targets.",
+                    "Use the repository's detected test framework; never translate another language "
+                    "into a Python import.",
                 ),
                 (
                     "user",
@@ -650,18 +1096,24 @@ def test_author_agent(
         )
 
     settings = config.model_config.get("test_author_agent") or config.model_config["test_case_agent"]
+    native_test_type = native_test_type_for_project(config)
+    author_instruction = (
+        f"Keep tests in native {config.test_framework} format with test_type='{native_test_type}'."
+        if native_test_type
+        else "Keep executable Python cases as pytest/static_check tests."
+    )
     try:
         batch = call_model_json(
             settings,
             [
                 (
                     "system",
-                    "You are the CodeCross Test Author Agent. Review draft pytest cases, "
+                    "You are the CodeCross Test Author Agent. Review draft test cases, "
+                    f"{author_instruction} "
                     "keep them safe, add narrow control tests when useful, and never use "
                     "network, subprocess, filesystem mutation, eval, or exec. "
                     "Reject placeholder tests, pass-only tests, and `assert True` tests. "
-                    "For JavaScript/TypeScript/Vue targets, do not convert file paths into Python imports; "
-                    "use concrete static source assertions or return skipped_targets instead.",
+                    "Never convert non-Python file paths into Python imports.",
                 ),
                 (
                     "user",
@@ -923,9 +1375,14 @@ def test_result_analyzer_agent(
                 gaps.append(f"{finding_id}: failed test was not reproducible")
                 need_targeted = True
             elif result.status == "passed":
-                suggested[finding_id] = "refuted"
+                suggested[finding_id] = "not_reproduced"
             elif result.status in {"error", "timeout", "unsafe", "skipped"}:
-                suggested.setdefault(finding_id, "inconclusive")
+                # 缺工具/依赖/构建环境属于明确的不可测试，而不是普通 inconclusive。
+                # 这与 Board 的确定性状态规则保持一致，避免 Analyzer 随后把状态改回去。
+                if result.status == "unsafe" or result.error_type.startswith("not_testable_"):
+                    suggested.setdefault(finding_id, "not_testable")
+                else:
+                    suggested.setdefault(finding_id, "inconclusive")
                 gaps.append(f"{finding_id}: executor status {result.status}")
                 need_targeted = True
 

@@ -39,7 +39,20 @@ variables in the repository that runs CodeCross:
 - `ANTHROPIC_API_KEY`
 - `ANTHROPIC_BASE_URL`
 - `ANTHROPIC_MODEL`
+- `CODECROSS_HUMAN_ALIGNMENT_PRIMARY_PROVIDER`（可选；公开 human benchmark 默认 `anthropic`）
 - `CODECROSS_MOCK_LLM` as a variable, only for CI wiring tests
 
 Local execution reads `.env`; GitHub Actions reads Secrets and Variables. This
 keeps the same runtime behavior without putting tokens in source control.
+
+## Evaluation
+
+先运行不访问网络的本地评测：
+
+```powershell
+.\.venv\Scripts\python.exe -m codecross.evaluation.cli local
+```
+
+项目还提供 LangSmith dataset/experiment 适配，以及 Martian Code Review Bench
+和 SWE-PRBench 公开数据导入、断点续跑及官方核心三分类评分。完整说明见
+[`evals/README.md`](evals/README.md)。
