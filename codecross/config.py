@@ -73,6 +73,12 @@ class RunnerConfig:
     max_verification_rounds: int = 3
     max_tests_per_round: int = 8
     test_timeout_seconds: int = 20
+    # AI 生成测试默认只能进入容器；trusted_local 仅供可信代码的显式本地调试。
+    execution_mode: Literal["docker", "trusted_local"] = "docker"
+    sandbox_memory_mb: int = 512
+    sandbox_cpu_count: float = 1.0
+    sandbox_pids_limit: int = 64
+    sandbox_output_limit_bytes: int = 1_000_000
     allow_network: bool = False
     allow_write_outside_project: bool = False
     fail_open: bool = True
@@ -166,7 +172,17 @@ def load_project_config(
     """
 
     root = Path(project_root).resolve() if project_root else PROJECT_ROOT
+    # Capture this before reading the target project's .env: source being reviewed
+    # must not be able to opt itself into executing generated tests on the host.
+    host_execution_mode = os.environ.get("CODECROSS_TEST_EXECUTION_MODE")
+    execution_mode = (host_execution_mode or "docker").strip().lower()
+    if execution_mode not in {"docker", "trusted_local"}:
+        raise ValueError("CODECROSS_TEST_EXECUTION_MODE must be docker or trusted_local")
     _load_env(root, override=project_root is not None)
+    if host_execution_mode is None:
+        os.environ.pop("CODECROSS_TEST_EXECUTION_MODE", None)
+    else:
+        os.environ["CODECROSS_TEST_EXECUTION_MODE"] = host_execution_mode
     profile = detect_project(root, diff=diff)
 
     deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
@@ -378,6 +394,7 @@ def load_project_config(
         max_final_findings=6 if review_profile == "human_review_alignment" else 5,
         prompt_version=os.getenv("CODECROSS_PROMPT_VERSION", "v0.25"),
         runner_config=RunnerConfig(
+            execution_mode=execution_mode,  # type: ignore[arg-type]
             # 复制 argv，防止调用方后续修改原 list 时悄悄改变正在运行的配置。
             test_command_override=(
                 list(test_command_override) if test_command_override else None

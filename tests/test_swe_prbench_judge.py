@@ -1,9 +1,12 @@
 """SWE-PRBench 官方核心口径的纯本地回归测试。"""
 
+import pytest
+
 from codecross.evaluation.models import PredictedFinding, ReferenceFinding
 from codecross.evaluation.swe_prbench_judge import (
     _SYSTEM_PROMPT,
     SWEAgentClassification,
+    SWEHumanCommentStatus,
     SWEJudgeBatch,
     score_swe_prbench_core,
     _build_structured_diff_snippet,
@@ -40,7 +43,8 @@ def test_plausible_comment_is_not_counted_as_official_false_positive():
                 classification="PLAUSIBLE",
                 actionability_score=4,
             ),
-        ]
+        ],
+        human_comment_statuses=[SWEHumanCommentStatus(comment_id="human-0", status="CAUGHT", matched_agent_comment_id="agent-0")],
     )
 
     metrics = score_swe_prbench_core(refs, predictions, decision)
@@ -71,7 +75,8 @@ def test_duplicate_confirmed_matches_are_normalized_one_to_one():
                 actionability_score=5,
                 confidence=0.9,
             ),
-        ]
+        ],
+        human_comment_statuses=[SWEHumanCommentStatus(comment_id="human-0", status="CAUGHT", matched_agent_comment_id="agent-1")],
     )
 
     metrics = score_swe_prbench_core(refs, predictions, decision)
@@ -93,6 +98,13 @@ def test_fabricated_comment_contributes_to_fpr():
 
     assert metrics.false_positive_rate == 1.0
     assert metrics.fabricated_count == 1
+
+
+def test_missing_judge_id_is_rejected_instead_of_becoming_plausible():
+    decision = SWEJudgeBatch(agent_classifications=[])
+
+    with pytest.raises(ValueError, match="agent IDs"):
+        score_swe_prbench_core([], [_prediction("unjudged")], decision)
 
 
 def test_structured_diff_prefers_logic_rich_implementation_chunk():

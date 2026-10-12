@@ -24,6 +24,7 @@ class ReferenceFinding(EvaluationModel):
     """一个人工确认或 benchmark 提供的标准问题。"""
 
     description: str
+    comment_id: str = ""
     severity: Severity | None = None
     category: str = ""
     file_path: str = ""

@@ -6,11 +6,17 @@
 """
 
 from pathlib import Path
+from functools import partial
 
 import codecross.executor as executor
-from codecross.config import RunnerConfig
+from codecross.config import RunnerConfig as _RunnerConfig
 from codecross.executor import execute_test_cases
 from codecross.schemas import TestCase, TestResult
+
+
+# These legacy tests exercise the explicitly trusted host path. New tests cover
+# Docker as the default and verify that missing isolation never falls back.
+RunnerConfig = partial(_RunnerConfig, execution_mode="trusted_local")
 
 
 def test_executor_runs_pytest_and_reports_failure(tmp_path: Path):

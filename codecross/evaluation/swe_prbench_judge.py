@@ -234,19 +234,47 @@ def run_swe_prbench_judge(
         timeout_seconds=180,
         retry_count=2,
     )
-    result = call_model_json(
-        settings,
-        [
-            ("system", _SYSTEM_PROMPT),
-            (
-                "user",
-                f"{_render_judge_input(diff, references, predictions)}\n\n"
-                f"{json_schema_instruction(SWEJudgeBatch)}",
-            ),
-        ],
-        SWEJudgeBatch,
-    )
-    return result  # type: ignore[return-value]
+    messages = [
+        ("system", _SYSTEM_PROMPT),
+        (
+            "user",
+            f"{_render_judge_input(diff, references, predictions)}\n\n"
+            f"{json_schema_instruction(SWEJudgeBatch)}",
+        ),
+    ]
+    for attempt in range(2):
+        result = call_model_json(settings, messages, SWEJudgeBatch)
+        try:
+            validate_swe_judge_batch(references, predictions, result)
+        except ValueError:
+            if attempt == 1:
+                raise
+        else:
+            return result  # type: ignore[return-value]
+    raise AssertionError("unreachable")
+
+
+def validate_swe_judge_batch(
+    references: list[ReferenceFinding],
+    predictions: list[PredictedFinding],
+    decision: SWEJudgeBatch,
+) -> None:
+    """Reject omitted, duplicate and invented IDs instead of improving FPR by default."""
+
+    expected_agents = {f"agent-{index}" for index in range(len(predictions))}
+    expected_humans = {f"human-{index}" for index in range(len(references))}
+    agent_ids = [item.comment_id for item in decision.agent_classifications]
+    human_ids = [item.comment_id for item in decision.human_comment_statuses]
+    if len(agent_ids) != len(expected_agents) or set(agent_ids) != expected_agents:
+        raise ValueError("SWE-PRBench judge returned incomplete or duplicate agent IDs")
+    if len(human_ids) != len(expected_humans) or set(human_ids) != expected_humans:
+        raise ValueError("SWE-PRBench judge returned incomplete or duplicate human IDs")
+    for item in decision.agent_classifications:
+        if item.classification == "CONFIRMED" and item.matched_human_comment_id not in expected_humans:
+            raise ValueError(f"judge matched unknown human ID: {item.comment_id}")
+    for item in decision.human_comment_statuses:
+        if item.status == "CAUGHT" and item.matched_agent_comment_id not in expected_agents:
+            raise ValueError(f"judge matched unknown agent ID: {item.comment_id}")
 
 
 def score_swe_prbench_core(
@@ -261,6 +289,7 @@ def score_swe_prbench_core(
     PLAUSIBLE，防止重复 finding 虚增 detection。
     """
 
+    validate_swe_judge_batch(references, predictions, decision)
     valid_agent_ids = {f"agent-{index}" for index in range(len(predictions))}
     valid_human_ids = {f"human-{index}" for index in range(len(references))}
     supplied = {item.comment_id: item for item in decision.agent_classifications}

@@ -1,8 +1,8 @@
 # CodeCross 评测指南
 
 这套评测分成两层：仓库内代码负责稳定的数据契约和评分口径；LangSmith 负责
-数据集版本、实验运行、调用链、成本与结果看板。即使暂时没有 LangSmith Key，
-本地评测仍然可以完整运行。
+数据集版本、实验运行、调用链、成本与结果看板。没有 LangSmith Key 仍可运行本地
+评审回归；证据验证若缺少 Docker/镜像会明确返回 `not_testable`，不会在宿主机执行。
 
 ## 1. 先运行本地评测
 
@@ -73,7 +73,7 @@ candidate 和 golden 是否描述同一个底层问题。每个 golden/candidate
 - `semantic_finding_*`：使用 LLM judge 的语义匹配指标，适合公开自然语言评论；
 - latency/token/cost：由 LangSmith trace/experiment 提供，不属于质量分数本身。
 
-## 5. SWE-PRBench：可恢复运行与官方核心指标
+## 5. SWE-PRBench：可恢复运行、内部诊断与官方导出
 
 SWE-PRBench 的 frozen context 已经包含 diff，因此适配器会设置
 `prebuilt_context_owns_diff=true`，Reviewer/Critic 不会再拼接第二份 patch。真实模型
@@ -87,7 +87,7 @@ python -m codecross.evaluation.cli swe-prbench-run `
   --run-label v025-development --skip-existing --real-models
 ```
 
-只补跑指定题可重复传 `--task-id`。已有结果用三分类 Judge 评分时，逐个传入
+只补跑指定题可重复传 `--task-id`。已有结果用 CodeCross 自定义三分类 Judge 作内部诊断时，逐个传入
 `--result`：
 
 ```powershell
@@ -100,12 +100,32 @@ python -m codecross.evaluation.cli swe-prbench-score `
 ```
 
 `--finding-layer` 支持 `raw / deduplicated / final / verified`。它只用于定位召回在哪一层
-丢失，正式 SWE 成绩必须使用 `final`；报告会保存层名，避免把 raw 诊断结果误写成产品成绩。
+丢失，对外 Reviewer 结果使用 `final`；报告会保存层名。报告分母现在固定为 manifest
+全部任务，缺文件、空输出、无效运行和 Judge 错误分别列出。Judge 缺少 comment ID 时
+会重试并拒绝不完整评分，而不是默认为 `PLAUSIBLE`。
 
 SWE 的 `false_positive_rate` 只统计事实错误的 `FABRICATED`；正确但未命中 human
 golden 的意见是 `PLAUSIBLE`，不能按普通二元匹配算 FP。当前实现严格提供不依赖
-embedding 的 Detection Rate、FPR、P/R/F1 与 actionability；`overall_score` 明确为
-`null`，因为论文 Overall 还依赖官方 code embedding，禁止生成伪可比分数。
+embedding 的 Detection Rate、FPR、P/R/F1 与 actionability 的**内部近似诊断**；
+自定义 Judge 与官方 GPT-5.2 Judge 不同，`overall_score` 明确为 `null`，不能拿这些
+数字直接与官方排行榜相减。
+
+若要准备同协议评测，先将完整 manifest 的结果（缺失任务也会导出失败占位）转换
+为官方 v0.4.1 `AgentOutput` 结构，再使用官方 harness/Judge 评分；转换本身不会产生
+榜单成绩，也不会调用模型：
+
+```powershell
+python -m codecross.evaluation.cli swe-prbench-export `
+  --manifest evals/swe_prbench_holdout_v3.json `
+  --context-config config_A `
+  --finding-layer final `
+  --result .codecross/swe-prbench-runs/v025-development/task__config_A__v025-development.json `
+  --output-dir .codecross/swe-prbench-agent-outputs
+```
+
+适配器还支持 `source_split=all_prs` 的 manifest，从官方 `prs.jsonl` 读取 350 PR；
+`eval_100` 与全量任务不得混成一个分母。SWE-bench 原版的 resolved rate 是 issue
+修复指标，不是 PR review 的 DR/FPR。
 
 当前 v3 的 15 题已经全部用于 development，不能再称为盲测。新的
 `evals/swe_prbench_holdout_v4.json` 含 10 个未读取 annotation 的 sealed task，状态为
@@ -122,6 +142,7 @@ LangSmith 里主要查看 `valid_review_run`、`swe_detection_rate`、
 `swe_false_positive_rate`、`swe_precision` 和 `swe_plausible_rate`。开发集与 sealed
 集必须分开实验，不能在看过 sealed 逐题结果后继续调 Prompt 并仍称其为 holdout。
 
-截至 v0.25，15 题 development 的真实结果是 valid=100%、DR=0.152088、
-FPR=0.077778。稳定性和 FPR 已达标，但 DR 未达 0.30，所以 v4 尚未运行，LangSmith
-也没有发布“正式验收通过”实验。这个结论应保留，不能用 trace success rate 替代。
+截至 v0.25，旧自定义 Judge 对 15 题 development 的历史报告是 valid=100%、
+DR=0.152088、FPR=0.077778；这些不是官方成绩。新版人工评论筛选规则会改变口径，
+必须重跑评分，不能直接沿用旧数。DR 仍低于预设的 0.30 目标，v4 未作为正式封存集
+发布成绩。离线问题分布见 [15 PR 诊断](../docs/evaluation-diagnosis-v025.md)。

@@ -603,10 +603,11 @@ def test_state_output_keeps_precritic_deduplicated_layer():
     assert output.findings == []
 
 
-def test_bundled_local_suite_passes_without_network():
+def test_bundled_local_suite_passes_without_network(monkeypatch):
     """仓库自带的几个小评测必须能在 mock 模式下稳定通过。"""
 
     case_path = Path(__file__).resolve().parents[1] / "evals" / "local_cases.jsonl"
+    monkeypatch.setenv("CODECROSS_TEST_EXECUTION_MODE", "trusted_local")
     report = run_local_suite(load_cases_jsonl(case_path), mock_llm=True)
 
     assert report.case_count >= 3

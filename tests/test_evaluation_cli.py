@@ -1,6 +1,9 @@
 """评测 CLI 的参数和断点文件契约测试；不访问模型或公开网络。"""
 
 from pathlib import Path
+import json
+
+import codecross.evaluation.cli as eval_cli
 
 from codecross.evaluation.cli import (
     _safe_task_name,
@@ -10,9 +13,11 @@ from codecross.evaluation.cli import (
 )
 from codecross.evaluation.models import (
     CaseEvaluationResult,
+    EvaluationCase,
     EvaluationOutput,
     EvaluationScores,
     PredictedFinding,
+    ReferenceFinding,
 )
 
 
@@ -111,3 +116,35 @@ def test_judge_calibration_requires_input_and_accepts_output(tmp_path: Path):
 
     assert args.cases == cases
     assert args.output == output
+
+
+def test_swe_score_uses_manifest_denominator_and_reports_missing(monkeypatch, tmp_path: Path):
+    cases = [
+        EvaluationCase(
+            case_id=f"swe-prbench:demo__{index}", name="demo", diff="",
+            reference_findings=[ReferenceFinding(description="issue")],
+            metadata={"task_id": f"demo__{index}", "manifest_sha256": "fixture"},
+        )
+        for index in (1, 2)
+    ]
+    monkeypatch.setattr(eval_cli, "load_swe_prbench_cases", lambda **kwargs: cases)
+    result = CaseEvaluationResult(
+        case_id=cases[0].case_id, name="demo",
+        output=EvaluationOutput(board_metrics={"reviewer_count": 1, "reviewer_success_count": 1}),
+        scores=EvaluationScores(),
+    )
+    result_path = tmp_path / "case.json"
+    result_path.write_text(result.model_dump_json(), encoding="utf-8")
+    report_path = tmp_path / "report.json"
+
+    eval_cli.main([
+        "swe-prbench-score", "--result", str(result_path), "--output", str(report_path),
+    ])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert report["case_count"] == 2
+    assert report["valid_case_count"] == 1
+    assert report["valid_run_rate"] == 0.5
+    assert report["missing_case_ids"] == [cases[1].case_id]
+    assert report["no_output_case_ids"] == [cases[0].case_id]
+    assert report["overall_score"] is None

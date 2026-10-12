@@ -498,7 +498,19 @@ def execute_native_test_case(
             error_type="low_value_test",
         )
 
-    first = run_native_test_once(
+    if runner_config.execution_mode == "docker":
+        from .sandbox import run_sandboxed_test_once
+
+        run_once = run_sandboxed_test_once
+    elif runner_config.execution_mode == "trusted_local":
+        run_once = run_native_test_once
+    else:
+        return _result(
+            test_case, round_index=round_index, adapter=adapter, status="skipped",
+            failure_summary="unknown execution mode", error_type="not_testable_execution_mode",
+        )
+
+    first = run_once(
         test_case,
         project_root=project_root,
         round_index=round_index,
@@ -507,7 +519,7 @@ def execute_native_test_case(
     )
     if first.status != "failed":
         return first
-    second = run_native_test_once(
+    second = run_once(
         test_case,
         project_root=project_root,
         round_index=round_index,

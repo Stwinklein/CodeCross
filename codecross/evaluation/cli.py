@@ -22,6 +22,7 @@ from .judges import (
 )
 from .runner import load_cases_jsonl, run_case, run_local_suite, write_cases_jsonl, write_report
 from .swe_prbench import load_swe_prbench_cases
+from .swe_prbench_export import official_agent_output
 from .swe_prbench_judge import run_swe_prbench_judge, score_swe_prbench_core
 
 
@@ -153,7 +154,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     swe_score = subparsers.add_parser(
         "swe-prbench-score",
-        help="用官方三分类核心口径评分已有逐题结果，不重新运行 Reviewer。",
+        help="用 CodeCross 自定义 Judge 评分已有逐题结果（内部诊断分，不是官方榜分）。",
     )
     swe_score.add_argument("--manifest", type=Path, default=DEFAULT_SWE_MANIFEST)
     swe_score.add_argument("--cache-dir", type=Path, default=DEFAULT_SWE_CACHE)
@@ -183,6 +184,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=PROJECT_ROOT / ".codecross" / "swe-prbench-core-score.json",
     )
+    swe_export = subparsers.add_parser(
+        "swe-prbench-export",
+        help="将 CodeCross 逐题结果导出为官方 v0.4.1 AgentOutput JSON；不运行付费 Judge。",
+    )
+    swe_export.add_argument("--manifest", type=Path, default=DEFAULT_SWE_MANIFEST)
+    swe_export.add_argument("--cache-dir", type=Path, default=DEFAULT_SWE_CACHE)
+    swe_export.add_argument("--context-config", choices=["config_A", "config_B", "config_C"], default="config_A")
+    swe_export.add_argument("--result", type=Path, action="append", required=True)
+    swe_export.add_argument("--finding-layer", choices=["raw", "deduplicated", "final", "verified"], default="final")
+    swe_export.add_argument("--model-label", default="codecross", help="官方 AgentOutput 的产品标识，不冒充单一底层模型。")
+    swe_export.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / ".codecross" / "swe-prbench-agent-outputs")
     return parser.parse_args(argv)
 
 
@@ -244,6 +256,18 @@ def _select_swe_score_findings(
         return list(layers[layer])
     except KeyError as exc:  # pragma: no cover - argparse 已限制，保留给直接函数调用者。
         raise ValueError(f"未知 Finding 层: {layer}") from exc
+
+
+def _valid_swe_run(result: CaseEvaluationResult) -> bool:
+    board = result.output.board_metrics
+    reviewer_count = int(board.get("reviewer_count") or 0)
+    reviewer_success = int(board.get("reviewer_success_count") or 0)
+    return (
+        reviewer_count > 0
+        and reviewer_count == reviewer_success
+        and not board.get("critic_error")
+        and not board.get("semantic_dedup_error")
+    )
 
 
 def _print_local_summary(report) -> None:
@@ -369,6 +393,56 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps({"case_count": len(cases), "results": summaries}, ensure_ascii=False), flush=True)
         return
 
+    if args.command == "swe-prbench-export":
+        cases = load_swe_prbench_cases(
+            cache_dir=args.cache_dir, manifest_path=args.manifest,
+            context_config=args.context_config,
+        )
+        cases_by_id = {case.case_id: case for case in cases}
+        results: dict[str, CaseEvaluationResult] = {}
+        for path in args.result:
+            result = CaseEvaluationResult.model_validate_json(path.read_text(encoding="utf-8"))
+            if result.case_id not in cases_by_id:
+                raise SystemExit(f"结果不属于当前 manifest: {result.case_id}")
+            if result.case_id in results:
+                raise SystemExit(f"重复结果 case_id: {result.case_id}")
+            results[result.case_id] = result
+        statuses = []
+        config_short = args.context_config[-1]
+        for case in cases:
+            result = results.get(case.case_id)
+            if result is None:
+                error = "missing_codecross_result"
+            elif not _valid_swe_run(result):
+                error = "invalid_codecross_run"
+            else:
+                error = None
+            predictions = (
+                _select_swe_score_findings(result.output, args.finding_layer)
+                if result is not None and error is None else []
+            )
+            output = official_agent_output(
+                case, predictions, context_config=args.context_config,
+                model_label=args.model_label, parse_error=error,
+            )
+            task_id = str(case.metadata["task_id"])
+            target = args.output_dir / f"{_safe_task_name(task_id)}_{config_short}_agent.json"
+            _write_json_atomic(output, target)
+            statuses.append({"task_id": task_id, "status": "exported" if error is None else error, "output": str(target)})
+        report = {
+            "protocol": "swe-prbench-v0.4.1-agent-output-only",
+            "manifest_sha256": cases[0].metadata.get("manifest_sha256") if cases else "",
+            "context_config": args.context_config,
+            "finding_layer": args.finding_layer,
+            "case_count": len(cases),
+            "valid_export_count": sum(item["status"] == "exported" for item in statuses),
+            "results": statuses,
+            "note": "仅导出官方输入结构；须由官方 harness/Judge 评分后才能与公开榜单对比。",
+        }
+        _write_json_atomic(report, args.output_dir / "export_manifest.json")
+        print(json.dumps({key: value for key, value in report.items() if key != "results"}, ensure_ascii=False), flush=True)
+        return
+
     if args.command == "swe-prbench-score":
         cases = load_swe_prbench_cases(
             cache_dir=args.cache_dir,
@@ -378,24 +452,24 @@ def main(argv: list[str] | None = None) -> None:
         cases_by_id = {case.case_id: case for case in cases}
         scored = []
         invalid = []
+        judge_errors = []
+        parse_errors = []
+        no_output = []
         seen_case_ids: set[str] = set()
         for result_path in args.result:
-            result = CaseEvaluationResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+            try:
+                result = CaseEvaluationResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                parse_errors.append({"path": str(result_path), "error": str(exc)})
+                print(json.dumps({"path": str(result_path), "status": "parse_error"}, ensure_ascii=False), flush=True)
+                continue
             if result.case_id in seen_case_ids:
                 raise SystemExit(f"重复结果 case_id: {result.case_id}")
             seen_case_ids.add(result.case_id)
             case = cases_by_id.get(result.case_id)
             if case is None:
                 raise SystemExit(f"结果不属于当前 manifest: {result.case_id}")
-            board = result.output.board_metrics
-            reviewer_count = int(board.get("reviewer_count") or 0)
-            reviewer_success = int(board.get("reviewer_success_count") or 0)
-            valid = (
-                reviewer_count > 0
-                and reviewer_count == reviewer_success
-                and not board.get("critic_error")
-                and not board.get("semantic_dedup_error")
-            )
+            valid = _valid_swe_run(result)
             if not valid:
                 invalid.append(result.case_id)
                 print(
@@ -404,16 +478,23 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 continue
             predictions = _select_swe_score_findings(result.output, args.finding_layer)
-            decision = run_swe_prbench_judge(
-                diff=case.diff,
-                references=case.reference_findings,
-                predictions=predictions,
-            )
-            metrics = score_swe_prbench_core(
-                case.reference_findings,
-                predictions,
-                decision,
-            )
+            if not predictions:
+                no_output.append(result.case_id)
+            try:
+                decision = run_swe_prbench_judge(
+                    diff=case.diff,
+                    references=case.reference_findings,
+                    predictions=predictions,
+                )
+                metrics = score_swe_prbench_core(
+                    case.reference_findings,
+                    predictions,
+                    decision,
+                )
+            except ValueError as exc:
+                judge_errors.append({"case_id": result.case_id, "error": str(exc)})
+                print(json.dumps({"case_id": result.case_id, "status": "judge_error"}, ensure_ascii=False), flush=True)
+                continue
             item = {
                 "case_id": result.case_id,
                 "task_id": case.metadata.get("task_id"),
@@ -440,15 +521,23 @@ def main(argv: list[str] | None = None) -> None:
             values = [float(item["metrics"][field]) for item in scored]
             return round(sum(values) / len(values), 6) if values else 0.0
 
+        missing_case_ids = sorted(set(cases_by_id) - seen_case_ids)
         report = {
-            "protocol": "swe-prbench-v0.4.1-official-core-without-embedding",
+            "protocol": "codecross-swe-prbench-core-v1-custom-judge",
             "context_config": args.context_config,
+            "manifest_sha256": cases[0].metadata.get("manifest_sha256") if cases else "",
+            "source_split": cases[0].metadata.get("source_split") if cases else "",
             # 报告必须带层名，否则 raw 诊断结果很容易被误读成正式 final 成绩。
             "finding_layer": args.finding_layer,
-            "case_count": len(args.result),
+            "case_count": len(cases),
+            "result_file_count": len(args.result),
             "valid_case_count": len(scored),
             "invalid_case_count": len(invalid),
-            "valid_run_rate": round(len(scored) / len(args.result), 6) if args.result else 0.0,
+            "missing_case_count": len(missing_case_ids),
+            "judge_error_count": len(judge_errors),
+            "parse_error_count": len(parse_errors),
+            "no_output_case_count": len(no_output),
+            "valid_run_rate": round(len(scored) / len(cases), 6) if cases else 0.0,
             # 官方 leaderboard 的聚合是先算每个 PR，再取均值；不能用全局 TP/FN
             # 替代，否则 human comment 较多的 PR 会获得额外权重。
             "mean_detection_rate": mean("detection_rate"),
@@ -457,8 +546,12 @@ def main(argv: list[str] | None = None) -> None:
             "mean_recall": mean("recall"),
             "mean_f1": mean("f1_score"),
             "overall_score": None,
-            "overall_note": "缺少官方 code embedding semantic alignment，禁止与 leaderboard Overall 直接比较。",
+            "overall_note": "使用 CodeCross 自定义 Judge，且缺少官方 embedding；这是内部诊断分，不可与官方榜单直接比较。",
             "invalid_case_ids": invalid,
+            "missing_case_ids": missing_case_ids,
+            "judge_errors": judge_errors,
+            "parse_errors": parse_errors,
+            "no_output_case_ids": no_output,
             "results": scored,
         }
         _write_json_atomic(report, args.output)

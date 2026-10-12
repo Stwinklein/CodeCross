@@ -17,6 +17,7 @@ def test_workflow_runs_v1_demo_with_two_reviewers():
     root = Path.cwd()
     diff = (root / "examples" / "diffs" / "safe_divide.diff").read_text(encoding="utf-8")
     config = load_project_config(root, mock_llm=True)
+    config.runner_config.execution_mode = "trusted_local"
 
     result = run_workflow(diff, project_root=root, config=config)
 

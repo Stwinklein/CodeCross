@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import codecross.evaluation.swe_prbench as adapter
 
 
@@ -113,3 +115,24 @@ def test_written_holdout_manifest_is_sealed_and_uses_config_a(tmp_path: Path):
     assert manifest["development_task_ids"] == []
     assert manifest["sealed_task_ids"] == selected
     assert manifest["additional_exclusions"] == ["old__1"]
+
+
+def test_official_substantive_ids_override_initiating_flag():
+    annotation = {
+        "substantive_comment_ids": ["selected"],
+        "comments": [
+            {"comment_id": "selected", "is_initiating_comment": False},
+            {"comment_id": "other", "is_initiating_comment": True},
+        ],
+    }
+
+    assert [item["comment_id"] for item in adapter._eligible_comments(annotation)] == ["selected"]
+
+
+def test_all_prs_loader_reads_jsonl_and_rejects_duplicate_ids(tmp_path: Path):
+    path = tmp_path / "prs.jsonl"
+    path.write_text('{"task_id":"a__1"}\n{"task_id":"b__2"}\n', encoding="utf-8")
+    assert [row["task_id"] for row in adapter.load_all_prs(tmp_path)] == ["a__1", "b__2"]
+    path.write_text('{"task_id":"a__1"}\n{"task_id":"a__1"}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate"):
+        adapter.load_all_prs(tmp_path)

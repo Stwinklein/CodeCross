@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codecross"
-version = "1.6.0"
+version = "1.7.0"
 description = "Multi-agent code review workflow with GitHub PR comment integration."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -36,3 +36,4 @@ include = ["codecross*", "a2aproject*", "scripts*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+markers = ["docker: requires a Linux Docker engine and prepared sandbox images"]

@@ -529,18 +529,27 @@ def execute_pytest_case(
         )
 
     root = Path(project_root).resolve()
-    first = _run_pytest_once(
+    if runner_config.execution_mode == "docker":
+        from .sandbox import run_sandboxed_test_once
+
+        run_once = run_sandboxed_test_once
+    elif runner_config.execution_mode == "trusted_local":
+        run_once = _run_pytest_once
+    else:
+        return _skipped_result(test_case, round_index, "unknown execution mode", error_type="not_testable_execution_mode")
+
+    first = run_once(
         test_case,
-        root=root,
+        **({"project_root": root} if runner_config.execution_mode == "docker" else {"root": root}),
         round_index=round_index,
         runner_config=runner_config,
     )
     if first.status not in {"failed", "error", "timeout"}:
         return first
 
-    second = _run_pytest_once(
+    second = run_once(
         test_case,
-        root=root,
+        **({"project_root": root} if runner_config.execution_mode == "docker" else {"root": root}),
         round_index=round_index,
         runner_config=runner_config,
     )

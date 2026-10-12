@@ -6,14 +6,18 @@
 """
 
 from pathlib import Path
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 
 import codecross.native_executor as native
 from codecross.board import init_finding_verifications, update_finding_verifications_from_results
-from codecross.config import ProjectConfig, RunnerConfig
+from codecross.config import ProjectConfig, RunnerConfig as _RunnerConfig
 from codecross.schemas import Finding, LineRange, TestCase
+
+
+RunnerConfig = partial(_RunnerConfig, execution_mode="trusted_local")
 
 
 def _case(test_type: str, *, target_file: str, test_name: str, code: str) -> TestCase:

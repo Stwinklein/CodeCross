@@ -44,6 +44,40 @@ def load_eval_100(cache_dir: str | Path) -> list[dict[str, Any]]:
     return data
 
 
+def load_all_prs(cache_dir: str | Path) -> list[dict[str, Any]]:
+    """Read the official 350-PR JSONL, downloading it once if not cached."""
+
+    target = Path(cache_dir) / "prs.jsonl"
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with httpx.stream("GET", f"{DATASET_BASE}/prs.jsonl", follow_redirects=True, timeout=120.0) as response:
+            response.raise_for_status()
+            with target.open("wb") as stream:
+                for chunk in response.iter_bytes():
+                    stream.write(chunk)
+    records = [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not records or len({str(item["task_id"]) for item in records}) != len(records):
+        raise ValueError("SWE-PRBench prs.jsonl is empty or has duplicate task IDs")
+    return records
+
+
+def _eligible_comments(annotation: dict[str, Any]) -> list[dict[str, Any]]:
+    """Match eval_harness.loader's ground-truth selection exactly."""
+
+    comments = annotation.get("comments") or []
+    substantive_ids = set(annotation.get("substantive_comment_ids") or [])
+    if substantive_ids:
+        return [item for item in comments if item.get("comment_id") in substantive_ids]
+    return [item for item in comments if item.get("is_initiating_comment")]
+
+
+def _source_hash(path: Path, parsed: Any) -> str:
+    """Hash exact cached bytes; use canonical fixture data when downloads are mocked."""
+
+    data = path.read_bytes() if path.exists() else json.dumps(parsed, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
 def select_repository_diverse_tasks(
     records: list[dict[str, Any]],
     *,
@@ -127,9 +161,19 @@ def load_swe_prbench_cases(
     """按封存 manifest 加载 case；只在 evaluator reference 中放人类评论。"""
 
     cache = Path(cache_dir)
-    records = {str(item["task_id"]): item for item in load_eval_100(cache)}
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    source_split = str(manifest.get("source_split") or "eval_100")
+    if source_split == "eval_100":
+        source_records = load_eval_100(cache)
+    elif source_split == "all_prs":
+        source_records = load_all_prs(cache)
+    else:
+        raise ValueError(f"unsupported SWE-PRBench source_split: {source_split}")
+    records = {str(item["task_id"]): item for item in source_records}
     task_ids = [str(item) for item in manifest.get("task_ids") or []]
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError("SWE-PRBench manifest has duplicate task IDs")
+    manifest_hash = hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest()
     development_ids = {
         str(item) for item in manifest.get("development_task_ids") or []
     }
@@ -166,18 +210,14 @@ def load_swe_prbench_cases(
             f"{DATASET_BASE}/annotations/{task_id}_human.json",
             cache / "annotations" / f"{task_id}_human.json",
         )
+        eligible_comments = _eligible_comments(annotation)
         references = []
-        for comment in annotation.get("comments") or []:
+        for comment in eligible_comments:
             body = str(comment.get("body") or "").strip()
-            if (
-                not body
-                or comment.get("is_reply")
-                or comment.get("is_initiating_comment") is False
-            ):
-                continue
             references.append(
                 ReferenceFinding(
                     description=body,
+                    comment_id=str(comment.get("comment_id") or ""),
                     file_path=str(comment.get("file") or ""),
                     line_start=comment.get("line"),
                     line_end=comment.get("line"),
@@ -206,13 +246,14 @@ def load_swe_prbench_cases(
                     "head_commit": str(record.get("head_commit") or ""),
                     "changed_files": list(record.get("changed_files") or []),
                     "context_mode": f"frozen_{context_config}",
+                    "source_split": source_split,
+                    "manifest_sha256": manifest_hash,
+                    "annotation_sha256": _source_hash(cache / "annotations" / f"{task_id}_human.json", annotation),
+                    "context_sha256": _source_hash(cache / "contexts" / context_config / f"{task_id}.json", context),
                     "annotation_source": f"annotations/{task_id}_human.json",
                     "annotation_comment_ids": [
                         str(comment.get("comment_id") or "")
-                        for comment in annotation.get("comments") or []
-                        if comment.get("body")
-                        and not comment.get("is_reply")
-                        and comment.get("is_initiating_comment") is not False
+                        for comment in eligible_comments
                     ],
                     "license": "CC BY 4.0",
                     "dataset_version": dataset_version,

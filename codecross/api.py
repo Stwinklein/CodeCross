@@ -156,7 +156,7 @@ _RUN_LOCK = threading.Lock()
 RUN_STORE = SQLiteRunStore.from_environment()
 
 
-app = FastAPI(title="CodeCross API", version="1.6.0")
+app = FastAPI(title="CodeCross API", version="1.7.0")
 
 # The Vite dev server proxies `/api`, but CORS makes direct manual testing from
 # another local origin less surprising during development.
@@ -384,7 +384,7 @@ def _apply_request_config(config: ProjectConfig, request: CreateRunRequest) -> N
 
     runner_config = config.runner_config
     for key, value in request.runner_config.items():
-        if hasattr(runner_config, key):
+        if key in {"max_verification_rounds", "max_tests_per_round", "test_timeout_seconds", "cross_verification_max_per_round", "cross_verification_timeout_seconds"}:
             setattr(runner_config, key, value)
 
 
@@ -414,6 +414,9 @@ def _execute_run(run_id: str) -> None:
             diff=record.request.diff,
         )
         _apply_request_config(config, record.request)
+        # The browser/API is not a trusted-local execution control surface. A
+        # project .env or request override must never enable host test execution.
+        config.runner_config.execution_mode = "docker"
 
         def on_workflow_event(kind: str, payload: dict[str, Any]) -> None:
             """Translate workflow callbacks into user-visible run events."""
@@ -484,6 +487,13 @@ def create_run(request: CreateRunRequest) -> RunRecord:
 
     if not request.diff.strip():
         raise HTTPException(status_code=400, detail="diff must not be empty.")
+    allowed_runner_keys = {
+        "max_verification_rounds", "max_tests_per_round", "test_timeout_seconds",
+        "cross_verification_max_per_round", "cross_verification_timeout_seconds",
+    }
+    forbidden = sorted(set(request.runner_config) - allowed_runner_keys)
+    if forbidden:
+        raise HTTPException(status_code=400, detail=f"unsupported runner_config keys: {', '.join(forbidden)}")
 
     now = _utc_now()
     record = RunRecord(run_id=_short_id(), request=request, created_at=now, updated_at=now)

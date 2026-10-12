@@ -164,7 +164,9 @@ def test_create_poll_events_and_export_demo_run():
     final_payload = _wait_for_terminal_run(client, run_id)
 
     assert final_payload["status"] == "succeeded", final_payload.get("error")
-    assert final_payload["snapshot"]["evaluator_report"]["risk_level"] == "high"
+    # Without Docker, generated tests are inconclusive rather than host-run;
+    # the reviewer may still classify the unverified issue as medium risk.
+    assert final_payload["snapshot"]["evaluator_report"]["risk_level"] in {"medium", "high"}
     assert "CodeCross Bilingual Final Review Report" in final_payload["final_report"]
     assert "CodeCross Final Review Report" in final_payload["snapshot"]["final_report_en"]
     assert "CodeCross 最终审查报告（中文）" in final_payload["snapshot"]["final_report_zh"]
@@ -181,7 +183,7 @@ def test_create_poll_events_and_export_demo_run():
     assert history_response.status_code == 200
     history = history_response.json()
     assert history[0]["run_id"] == run_id
-    assert history[0]["risk_level"] == "high"
+    assert history[0]["risk_level"] == final_payload["snapshot"]["evaluator_report"]["risk_level"]
 
     markdown_response = client.get(f"/api/runs/{run_id}/export?format=markdown")
     assert markdown_response.status_code == 200
@@ -189,13 +191,27 @@ def test_create_poll_events_and_export_demo_run():
 
     json_response = client.get(f"/api/runs/{run_id}/export?format=json")
     assert json_response.status_code == 200
-    assert json_response.json()["evaluator_report"]["risk_level"] == "high"
+    assert json_response.json()["evaluator_report"]["risk_level"] == final_payload["snapshot"]["evaluator_report"]["risk_level"]
 
     with _RUN_LOCK:
         RUNS.clear()
     restored_response = client.get(f"/api/runs/{run_id}")
     assert restored_response.status_code == 200
     assert restored_response.json()["run_id"] == run_id
+
+
+def test_api_rejects_trusted_host_execution_override():
+    response = TestClient(app).post(
+        "/api/runs",
+        json={
+            "diff": "diff --git a/a.py b/a/a.py\n",
+            "project_root": str(Path.cwd()),
+            "runner_config": {"execution_mode": "trusted_local"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "execution_mode" in response.json()["detail"]
 
 
 def test_abort_marks_pending_run_as_cancel_requested():
