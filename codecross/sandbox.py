@@ -131,6 +131,26 @@ def snapshot_project(root: Path, destination: Path) -> None:
         target.chmod(target.stat().st_mode | 0o222)
 
 
+def _make_generated_test_readable(test_file: Path, workspace: Path) -> None:
+    """Let the non-root container user traverse generated paths in the copy.
+
+    ``TemporaryDirectory`` uses mode 0700 on Linux. The Docker bind mount is
+    read-only, so chmod only the disposable snapshot, never the source checkout.
+    """
+
+    try:
+        test_file.resolve().relative_to(workspace.resolve())
+    except ValueError as exc:
+        raise SnapshotError("generated test escaped the disposable workspace") from exc
+    cursor = test_file.parent
+    while True:
+        cursor.chmod(cursor.stat().st_mode | 0o555)
+        if cursor == workspace:
+            break
+        cursor = cursor.parent
+    test_file.chmod(test_file.stat().st_mode | 0o444)
+
+
 def _docker_available() -> bool:
     global _AVAILABILITY_CACHE
     with _AVAILABILITY_LOCK:
@@ -269,6 +289,7 @@ def run_sandboxed_test_once(
                     return _not_testable(case, round_index, "not_testable_unsupported_native_type")
                 # File placement and command selection are reused, but only in the copy.
                 with prepared_native_test_file(case, root=workspace, adapter=adapter) as test_file:
+                    _make_generated_test_readable(test_file, workspace)
                     inner_command = build_native_command(
                         case, test_file=test_file, root=workspace,
                         project_config=project_config or ProjectConfig(),

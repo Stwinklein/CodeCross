@@ -96,3 +96,21 @@ def test_container_command_enforces_security_limits(tmp_path: Path):
     assert "--cpus" in command
     assert "--pull" in command and command[command.index("--pull") + 1] == "never"
     assert not any("SECRET=" in token for token in command)
+
+
+def test_generated_test_is_readable_to_container_only_within_snapshot(tmp_path: Path):
+    workspace = tmp_path / "snapshot"
+    generated_dir = workspace / ".codecross-tmp" / "native-jest-example"
+    generated_dir.mkdir(parents=True)
+    generated_dir.chmod(0o700)
+    test_file = generated_dir / "codecross_test.js"
+    test_file.write_text("// generated\n", encoding="utf-8")
+
+    sandbox._make_generated_test_readable(test_file, workspace)
+
+    assert generated_dir.stat().st_mode & 0o555 == 0o555
+    assert test_file.stat().st_mode & 0o444 == 0o444
+    outside = tmp_path / "outside.js"
+    outside.write_text("// user-owned\n", encoding="utf-8")
+    with pytest.raises(sandbox.SnapshotError):
+        sandbox._make_generated_test_readable(outside, workspace)
