@@ -128,7 +128,7 @@ def page_one(c: canvas.Canvas) -> None:
          485, 10, 17, colors.HexColor("#DDEBF0"))
 
     metric(c, 40, 465, 161, "2", "默认独立 Reviewer", "逻辑 + 安全/可维护性")
-    metric(c, 217, 465, 161, "4", "真实 Docker 集成测试", "2026-10-12 验证")
+    metric(c, 217, 465, 161, "4", "真实 Docker 集成测试", "2026-10-14 GitHub CI")
     metric(c, 394, 465, 161, "350", "PR 数据记录", "SWE-PRBench 适配")
 
     text(c, 40, 422, "项目解决什么问题", 15, NAVY)
@@ -234,10 +234,11 @@ def page_three(c: canvas.Canvas) -> None:
 
 def page_four(c: canvas.Canvas) -> None:
     section_header(c, "03", "验证结果与对标边界", "数字附带口径；未完成的实验明确标注")
-    metric(c, 40, 620, 161, "201", "完整测试通过", "10-12：另有 1 项跳过")
-    metric(c, 217, 620, 161, "4", "Docker 测试通过", "10-12：真实 Linux 容器")
+    metric(c, 40, 620, 161, "198", "单元测试通过", "CI：另有 1 项跳过")
+    metric(c, 217, 620, 161, "4", "Docker 测试通过", "CI：真实 Linux 容器")
     metric(c, 394, 620, 161, "350", "唯一 PR task_id", "官方 prs.jsonl 数据")
-    text(c, 40, 596, "10-14 Docker 未就绪：197 通过、5 跳过；10-12 容器测试涵盖隔离、Node、PID 限额与超时清理。", 8, MUTED)
+    text(c, 40, 596, "2026-10-14 GitHub Actions 两项作业均成功；容器测试覆盖隔离、Node、PID 限额与超时。", 8, MUTED)
+    c.linkURL("https://github.com/Stwinklein/CodeCross/actions/runs/38572612331", (40, 587, 555, 610), relative=0)
 
     text(c, 40, 555, "评测协议：为公平比较准备什么", 14, NAVY)
     stages = (
