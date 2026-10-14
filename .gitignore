@@ -15,6 +15,8 @@ htmlcov/
 
 # CodeCross local run history and scratch state.
 .codecross/
+output/
+tmp/pdfs/
 
 # Frontend dependencies and build output.
 frontend/node_modules/

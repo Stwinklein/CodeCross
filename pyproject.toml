@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "codecross"
 version = "1.7.0"
-description = "Multi-agent code review workflow with GitHub PR comment integration."
+description = "Multi-agent PR code review with Docker-isolated test verification and auditable SWE-PRBench evaluation."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

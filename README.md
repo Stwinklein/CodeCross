@@ -6,6 +6,26 @@
 
 CodeCross 是一个多智能体 PR 代码评审工具：读取 diff 和相关代码上下文，运行独立 Reviewer，去重与筛选问题，并可生成双语报告和 GitHub PR 评论。可选的证据验证环节会尝试运行 AI 生成的测试；**默认只在一次性 Docker 容器中执行**，没有可用的 Linux Docker 引擎时标记为 `not_testable`，不会退回宿主机运行。
 
+### 项目速览
+
+面向 AI 应用与研发岗位，这个项目展示了从多 Agent 编排、结构化问题合并，到可控工具执行和可审计评测的一条完整链路。默认由两名独立 Reviewer 审阅同一份 PR；评审问题进入 Review Board 后，可选择性生成测试来补充证据，最后输出带风险级别和验证状态的报告。自动化测试执行与 PR 评审基准是两条不同的路径：SWE-PRBench 的 `review_only` 评测不调用 Docker 测试。
+
+```mermaid
+flowchart LR
+    A[PR diff + 代码上下文] --> B[Planner / Context Retriever]
+    B --> C1[Reviewer: 逻辑]
+    B --> C2[Reviewer: 安全与可维护性]
+    C1 --> D[Review Board: 去重、筛选、状态追踪]
+    C2 --> D
+    D -->|可选证据验证| E[测试策略与生成]
+    E --> F[一次性 Docker 隔离执行]
+    F --> G[结果分析与定向复核]
+    G --> D
+    D --> H[风险评估与双语报告 / PR 评论]
+```
+
+当前可核验的是工程能力与评测流程，而非官方榜单优势：仓库包含真实 Docker 边界测试，以及对 SWE-PRBench 350 个 PR 数据记录的适配和官方输出结构导出；**尚未完成同一基准、同一裁判下与商业 Reviewer 的正式对照**。历史 15 PR 自定义 Judge 诊断见下文，不能当作当前版本或官方成绩。
+
 ### 本地安装
 
 需要 Python 3.12+。Windows PowerShell 示例：
@@ -61,6 +81,26 @@ GitHub Actions 使用仓库 Secrets/Variables，不从源码读取密钥。模�
 ## English
 
 CodeCross is a multi-agent pull-request reviewer. It reads a diff and focused repository context, runs independent reviewers, deduplicates and ranks findings, and can produce a bilingual report or a GitHub PR comment. Its optional evidence-verification loop runs AI-generated tests **only in disposable Docker containers by default**. If a Linux Docker engine is unavailable, the result is `not_testable`; it never silently falls back to the host.
+
+### Project at a glance
+
+The project demonstrates an end-to-end AI application workflow: multi-agent orchestration, structured finding consolidation, controlled tool execution, and auditable evaluation. Two independent reviewers inspect a PR by default. Findings enter a Review Board, where optional generated tests can add evidence before the system produces a risk assessment, bilingual report, and PR comment. Automated test execution is separate from the `review_only` SWE-PRBench path, which does not invoke Docker tests.
+
+```mermaid
+flowchart LR
+    A[PR diff + code context] --> B[Planner / Context Retriever]
+    B --> C1[Logic Reviewer]
+    B --> C2[Security / Maintainability Reviewer]
+    C1 --> D[Review Board: dedupe, rank, track status]
+    C2 --> D
+    D -->|optional verification| E[Test strategy and generation]
+    E --> F[Disposable Docker sandbox]
+    F --> G[Result analysis and targeted review]
+    G --> D
+    D --> H[Risk assessment + bilingual report / PR comment]
+```
+
+The current evidence supports engineering and evaluation-readiness claims, not leaderboard superiority: the repository includes real Docker boundary tests, support for the 350-PR SWE-PRBench data records, and an exporter for the official output schema. **A controlled, same-benchmark comparison against commercial reviewers has not yet been run.** The historical 15-PR custom-judge diagnosis below is neither a current-version nor an official score.
 
 ### Local setup
 
